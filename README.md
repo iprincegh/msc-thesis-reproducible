@@ -78,8 +78,6 @@ source("generate_figures/generate_publication_figures.R")
 source("generate_figures/generate_cv_figures.R")
 source("generate_figures/generate_cross_wave_figures.R")
 source("generate_figures/generate_nonlinearity_diagnostics.R")
-source("generate_figures/generate_pcatm_oof_figures.R")
-source("generate_figures/generate_cpo_pit_plots.R")
 ```
 
 ## Data Structure
