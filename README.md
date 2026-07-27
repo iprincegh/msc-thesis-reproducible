@@ -67,7 +67,7 @@ generate_figures/                # Publication figure generators
 
 ```r
 setwd("<project-root>")
-rmarkdown::render("pipeline/02b_case_data.Rmd")
+rmarkdown::render("pipeline/00_setup.Rmd")
 ```
 
 ### Generate figures
