@@ -1,0 +1,140 @@
+---
+title: "02 - Population Offset E_g (Year-Specific)"
+author: "Prince Oppong Boakye"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+---
+
+# Population Offset E_g (Year-Specific)
+
+Extracts year-specific population from WorldPop 100 m rasters per Section 3.3:
+$E_{g,t} = \text{pop}_g(\text{year})$, floored at 0.1 to prevent $\log(0)$.
+
+Output: `population_{state}_{year}.csv` with columns `grid_id`, `population`, `E`, `log_E`.
+
+```{r setup, include=FALSE}
+source(here::here("helpers/_utils.R"))
+load_pipeline()
+
+library(data.table); library(sf); library(terra); library(exactextractr)
+library(ggplot2);    library(viridis); library(patchwork); library(ggspatial)
+
+study_years <- unique(as.character(WAVE_RUNS$acs_year))
+PLOT_PIX_M  <- 400  # pixel size (m) for NY plot rasterization (visual only)
+```
+
+# Extract Population
+
+```{r extract}
+fmt_dur <- function(s) {
+  s <- as.numeric(s)
+  if (s < 60) sprintf("%.1fs", s)
+  else if (s < 3600) sprintf("%dm %02ds", s %/% 60, round(s %% 60))
+  else sprintf("%dh %02dm", s %/% 3600, (s %% 3600) %/% 60)
+}
+
+extract_pop <- function(grid_sf, year, label = "") {
+  t0 <- Sys.time()
+  message(sprintf("  [%s] %s: loading raster ...", format(t0, "%H:%M:%S"), label))
+  r <- terra::rast(file.path(CONFIG$pop_raster_dir,
+         sprintf("usa_pop_%s_CN_100m_R2025A_v1.tif", year)))
+
+  message(sprintf("  [%s] %s: reprojecting %s cells to raster CRS ...",
+                  format(Sys.time(), "%H:%M:%S"), label,
+                  format(nrow(grid_sf), big.mark = ",")))
+  grid_in_r <- st_transform(grid_sf, terra::crs(r))
+
+  message(sprintf("  [%s] %s: extracting (exact_extract, sum) ...",
+                  format(Sys.time(), "%H:%M:%S"), label))
+  v <- exactextractr::exact_extract(r, grid_in_r, "sum", progress = TRUE)
+  v[is.na(v)] <- 0
+  pop <- round(v, 2)
+
+  dt <- data.table(grid_id = grid_sf$grid_id, population = pop,
+                   E = pmax(pop, 0.1), log_E = log(pmax(pop, 0.1)))
+  message(sprintf("  [%s] %s: done in %s (total pop = %s)",
+                  format(Sys.time(), "%H:%M:%S"), label,
+                  fmt_dur(difftime(Sys.time(), t0, units = "secs")),
+                  format(round(sum(pop)), big.mark = ",")))
+  dt
+}
+
+total_jobs <- length(CONFIG$states) * length(study_years)
+job_i <- 0L
+t_all <- Sys.time()
+
+for (state in CONFIG$states) {
+  message("\n=== ", state, " ===")
+  grid_sf <- st_read(file.path(CONFIG$grids_dir, sprintf("grid_100m_%s.gpkg", state)),
+                     quiet = TRUE)
+  for (year in study_years) {
+    job_i <- job_i + 1L
+    label <- sprintf("[%d/%d] %s %s", job_i, total_jobs, state, year)
+    out   <- file.path(CONFIG$grids_dir, sprintf("population_%s_%s.csv", state, year))
+    fwrite(extract_pop(grid_sf, year, label), out)
+    message("  wrote ", out)
+  }
+}
+
+message(sprintf("\nAll %d files written in %s.",
+                total_jobs, fmt_dur(difftime(Sys.time(), t_all, units = "secs"))))
+```
+
+# Visualization
+
+```{r viz, fig.width=14, fig.height=5, dev='png', dpi=120}
+plot_ut <- function(grid_sf, pop_dt, year) {
+  g <- merge(grid_sf, pop_dt[, .(grid_id, population)], by = "grid_id", all.x = TRUE)
+  g$log_pop <- log10(pmax(g$population, 1))
+  ggplot() +
+    geom_sf(data = g, aes(fill = log_pop), color = "grey40", linewidth = 0.4) +
+    scale_fill_viridis(option = "plasma", name = expression(log[10](E))) +
+    geom_sf_label(data = g[g$population > 50000, ],
+                  aes(label = paste0(county_name, "\n", scales::comma(population))),
+                  size = 2, fill = alpha("white", 0.7)) +
+    map_extras() + labs(title = sprintf("UT %s", year)) + theme_map()
+}
+
+plot_ny <- function(grid_sf, base_outline, cent_xy, bb, utm_crs, pop_dt, year) {
+  log_pop <- log10(pmax(pop_dt$population[match(grid_sf$grid_id, pop_dt$grid_id)], 1))
+  ix <- floor((cent_xy[, 1] - bb["xmin"]) / PLOT_PIX_M)
+  iy <- floor((cent_xy[, 2] - bb["ymin"]) / PLOT_PIX_M)
+  px <- data.table(ix = ix, iy = iy, lp = log_pop)[
+          , .(log_pop = mean(lp, na.rm = TRUE)), by = .(ix, iy)]
+  px[, x := bb["xmin"] + (ix + 0.5) * PLOT_PIX_M]
+  px[, y := bb["ymin"] + (iy + 0.5) * PLOT_PIX_M]
+  ggplot() +
+    geom_sf(data = base_outline, fill = "grey95", color = "grey70",
+            linewidth = 0.2, alpha = 0.4, inherit.aes = FALSE) +
+    geom_raster(data = px, aes(x = x, y = y, fill = log_pop)) +
+    coord_sf(crs = utm_crs) +
+    scale_fill_viridis(option = "plasma", name = expression(log[10](E))) +
+    map_extras() + labs(title = sprintf("NY %s", year)) + theme_map()
+}
+
+for (state in CONFIG$states) {
+  grid_sf <- st_read(file.path(CONFIG$grids_dir, sprintf("grid_100m_%s.gpkg", state)),
+                     quiet = TRUE)
+  utm_crs <- st_crs(grid_sf)
+  read_pop <- function(y) fread(file.path(CONFIG$grids_dir,
+                                          sprintf("population_%s_%s.csv", state, y)))
+
+  if (state == "UT") {
+    plots <- lapply(study_years, function(y) plot_ut(grid_sf, read_pop(y), y))
+  } else {
+    cbg <- st_transform(st_read(get_cbg_path(state), quiet = TRUE), utm_crs)
+    cbg <- cbg[substr(cbg$GEOID, 3, 5) %in% get_metro_fips(state, 3), ]
+    base_outline <- sf::st_union(cbg)
+    cent_xy <- sf::st_coordinates(sf::st_centroid(grid_sf))
+    bb      <- sf::st_bbox(grid_sf)
+    plots <- lapply(study_years, function(y)
+      plot_ny(grid_sf, base_outline, cent_xy, bb, utm_crs, read_pop(y), y))
+  }
+  print(wrap_plots(plots, ncol = length(study_years)))
+}
+```

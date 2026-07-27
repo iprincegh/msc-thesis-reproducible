@@ -1,0 +1,198 @@
+---
+title: "00 - Global Setup and Configuration"
+author: "Prince Oppong Boakye"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+---
+
+# Global Setup and Configuration
+
+Spatio-temporal disease mapping model (NYC & Utah):
+$$Y_{g,t} \sim \text{NegBin}(\mu_{g,t}, \theta)$$
+$$\log(\mu_{g,t}) = \log(E_g) + \log(\mu_0(t)) + \log(\rho(g,t)) + \mathbf{x}_{g,t}^\top\boldsymbol{\beta} + b_g + \gamma_t$$
+
+```{r setup, include=FALSE}
+source(here::here("helpers/_utils.R"))
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Packages
+
+```{r packages}
+library(data.table)
+library(sf)
+library(terra)
+library(spdep)
+library(INLA)
+library(ggplot2)
+library(viridis)
+library(ggspatial)
+library(patchwork)
+library(scales)
+library(arrow)
+library(jsonlite)
+library(DBI)
+library(duckdb)
+library(lubridate)
+```
+
+# Configuration
+
+```{r config}
+CONFIG <- list(
+
+  # ---- Directories ----
+  data_dir     = "data",
+  advan_dir    = file.path("data", "advan_weekly_plus"),
+  output_dir   = file.path("outputs", "spatiotemporal_risk"),
+  grids_dir    = file.path("outputs", "spatiotemporal_risk", "grids"),
+  figures_dir  = file.path("outputs", "spatiotemporal_risk", "figures"),
+  cache_dir    = file.path("outputs", "spatiotemporal_risk", "cache"),
+
+  # ---- Boundaries ----
+  ny_cbg_path  = file.path("data", "cbg_shapefiles", "newyork_shp", "tl_2024_36_bg.shp"),
+  ut_cbg_path  = file.path("data", "cbg_shapefiles", "utah_shp", "tl_2024_49_bg.shp"),
+  ut_counties_path = file.path("data", "ut_counties", "CensusCounties2010.shp"),
+
+  # ---- COVID Cases ----
+  covid_dir          = file.path("data", "us_CovidCases"),
+  nyc_caserate_path  = file.path("data", "us_CovidCases", "caseRate", "NYCcaserate-by-modzcta.csv"),
+  nyc_crosswalk_path = file.path("data", "us_CovidCases", "caseRate", "NYCcbg_to_modzcta.csv"),
+  nyc_modzcta_shp    = file.path("data", "MODZCTA",
+                                  "geo_export_5392c927-ee1e-4b9c-9787-2cad9456c83b.shp"),
+
+  # Utah: CDC case surveillance — monthly county counts
+  ut_county_cases_path = file.path("data", "us_CovidCases", "cdc_case_surveillance",
+                                    "utah_monthly_county_cases.csv"),
+  # NYT county-level daily cumulative (for daily case rate derivation)
+  nyt_counties_files = list(
+    "2020" = file.path("data", "us_CovidCases", "us-counties-2020.csv"),
+    "2021" = file.path("data", "us_CovidCases", "us-counties-2021.csv"),
+    "2022" = file.path("data", "us_CovidCases", "us-counties-2022.csv")),
+
+  # ---- Demographics ----
+  age_pop_paths = list(
+    "2020" = file.path("data", "demographics", "AgePop", "ACSST5Y2020.S0101-Data.csv"),
+    "2021" = file.path("data", "demographics", "AgePop", "ACSST5Y2021.S0101-Data.csv"),
+    "2022" = file.path("data", "demographics", "AgePop", "ACSST5Y2022.S0101-Data.csv")),
+  income_empl_paths = list(
+    "2020" = file.path("data", "demographics", "IncomeEmpl", "ACSDP5Y2020.DP03-Data.csv"),
+    "2021" = file.path("data", "demographics", "IncomeEmpl", "ACSDP5Y2021.DP03-Data.csv"),
+    "2022" = file.path("data", "demographics", "IncomeEmpl", "ACSDP5Y2022.DP03-Data.csv")),
+
+  # ---- Land Use & Buildings ----
+  ny_landuse_path     = file.path("data", "landuse", "nyc_mappluto_25v4_shp", "MapPLUTO.shp"),
+  ny_buildings_path   = file.path("data", "building_footprints", "NewYorkBuildings.geojson"),
+  ut_landuse_summary  = file.path("data", "landuse", "utah_parcels_lir", "utah_lir_landuse_by_county.csv"),
+  ut_buildings_path   = file.path("data", "building_footprints", "UtahBuildings.geojson"),
+
+  # ---- Grid ----
+  grid_size_m = 100,
+
+  # ---- CRS ----
+  wgs84_crs  = 4326,
+  ny_utm_crs = 32618,
+  ut_utm_crs = 32612,
+
+  # ---- NYC Metro (5 boroughs) ----
+  nyc_fips_5 = c("36061", "36047", "36081", "36005", "36085"),
+  nyc_fips_3 = c("061", "047", "081", "005", "085"),
+  nyc_names  = c("Manhattan", "Brooklyn", "Queens", "Bronx", "Staten Island"),
+  nyc_borough_codes = c("36061" = "MN", "36047" = "BK", "36081" = "QN",
+                        "36005" = "BX", "36085" = "SI"),
+
+  # ---- Utah (all 29 counties) ----
+  ut_state_fips = "49",
+  ut_fips_5 = c("49001", "49003", "49005", "49007", "49009", "49011",
+                "49013", "49015", "49017", "49019", "49021", "49023",
+                "49025", "49027", "49029", "49031", "49033", "49035",
+                "49037", "49039", "49041", "49043", "49045", "49047",
+                "49049", "49051", "49053", "49055", "49057"),
+  ut_fips_3 = c("001", "003", "005", "007", "009", "011",
+                "013", "015", "017", "019", "021", "023",
+                "025", "027", "029", "031", "033", "035",
+                "037", "039", "041", "043", "045", "047",
+                "049", "051", "053", "055", "057"),
+
+  # ---- Population Rasters ----
+  pop_raster_dir = file.path("data", "population"),
+
+  # ---- Transport ----
+  ut_roads_dir        = file.path("data", "transport", "utah_roads_statewide"),
+  ny_roads_shp        = file.path("data", "transport", "newyork_roads2", "tl_2023_36_prisecroads.shp"),
+  bridge_csv          = file.path("data", "transport", "Bridge_Ratings_20260213.csv"),
+  subway_stations_csv = file.path("data", "transport", "MTA_Subway_Stations_20260217.csv"),
+  subway_routes_shp   = file.path("data", "transport", "nyu_subway", "routes_nyc_subway_may2016.shp"),
+
+  # ---- Waves (continuous 3-month fitting periods) ----
+  waves = list(
+    wave1 = list(id = "wave1", months = c("2020-03", "2020-04", "2020-05"),
+                 label = "Wave 1: Initial Outbreak (Mar–May 2020)",
+                 acs_year = "2020"),
+    wave2 = list(id = "wave2", months = c("2020-12", "2021-01", "2021-02"),
+                 label = "Wave 2: Winter Surge (Dec 2020–Feb 2021)",
+                 acs_year = "2021"),
+    wave3 = list(id = "wave3", months = c("2021-12", "2022-01", "2022-02"),
+                 label = "Wave 3: Omicron (Dec 2021–Feb 2022)",
+                 acs_year = "2022")
+  ),
+  wave_ids = c("wave1", "wave2", "wave3"),
+
+  # ---- Model Parameters ----
+  spillover_phi   = 10000,
+  origin_lag      = 7,
+  spillover_alpha = 0.7,
+  bym_phi_prior   = c(0.5, 0.5),
+  bym_prec_prior  = c(1, 0.01),
+
+  states = c("NY", "UT")
+)
+
+# Create directories (wave-native: only one output dir per (state, wave))
+local({
+  for (d in c(CONFIG$output_dir, CONFIG$grids_dir, CONFIG$figures_dir, CONFIG$cache_dir)) {
+    dir.create(d, recursive = TRUE, showWarnings = FALSE)
+  }
+  for (state in CONFIG$states) {
+    for (wid in CONFIG$wave_ids) {
+      wave_dir <- file.path(CONFIG$output_dir, paste0(state, "_", wid))
+      for (sub in c("models", "tables", "intermediate", "figures", "network")) {
+        dir.create(file.path(wave_dir, sub), recursive = TRUE, showWarnings = FALSE)
+      }
+    }
+  }
+})
+```
+
+# Batch Runs
+
+```{r batch}
+WAVE_RUNS <- rbindlist(lapply(CONFIG$states, function(s) {
+  rbindlist(lapply(CONFIG$waves, function(w) {
+    data.table(state = s, wave_id = w$id, wave_label = w$label,
+               wave_months = list(w$months),
+               acs_year = w$acs_year)
+  }))
+}))
+WAVE_RUNS[, run_id  := paste0(state, "_", wave_id)]
+WAVE_RUNS[, out_dir := file.path(CONFIG$output_dir, run_id)]
+print(WAVE_RUNS)
+```
+
+# Save
+
+```{r save}
+# State-specific configs for safety; shared CONFIG.rds for downstream compatibility
+saveRDS(CONFIG, file.path(CONFIG$output_dir, "CONFIG.rds"))
+local({
+  for (s in CONFIG$states) {
+    saveRDS(CONFIG, file.path(CONFIG$output_dir, sprintf("CONFIG_%s.rds", s)))
+  }
+})
+saveRDS(WAVE_RUNS, file.path(CONFIG$output_dir, "WAVE_RUNS.rds"))
+```

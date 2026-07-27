@@ -1,0 +1,245 @@
+---
+title: "02b - Case Data Preparation"
+author: "Prince Oppong Boakye"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+---
+
+# Case Data Preparation
+
+Prepares COVID-19 case rates for all study periods.
+- **NYC**: weekly MODZCTA case rates → daily interpolation → borough spillover
+- **Utah**: NYT daily cumulative county counts → daily new cases → rate per 100k → neighbor spillover
+
+Output: `tables/case_rates.csv` per month with columns:
+`geo_id`, `date`, `sim_day`, `case_rate`, `case_rate_spillover`, `region`.
+
+```{r setup, include=FALSE}
+source(here::here("helpers/_utils.R"))
+load_pipeline()
+library(data.table)
+library(lubridate)
+```
+
+```{r gamma_t_helper}
+# Testing-adjustment γ_t (Meyer & Held 2017 §4.3; Slater et al. 2025 §3.4).
+# γ_t = (positivity_t / median(positivity))^(-0.5), clamped to ±log(3).
+# If data/us_CovidCases/testing/<state>_positivity.csv (date, positivity) is
+# absent, returns 0 (offset unchanged); the column is always present for 08a.
+load_log_gamma_t <- function(state, dates) {
+  fp <- here::here("data", "us_CovidCases", "testing",
+                   sprintf("%s_positivity.csv", state))
+  out <- data.table(date = as.Date(dates), log_gamma_t = 0)
+  if (!file.exists(fp)) return(out)
+  pos <- fread(fp)
+  pos[, date := as.Date(date)]
+  pos[, positivity := pmax(as.numeric(positivity), 1e-4)]
+  setorder(pos, date)
+  pos[, positivity := zoo::rollmean(positivity, k = 7, fill = NA, align = "center")]
+  pos[is.na(positivity), positivity := median(pos$positivity, na.rm = TRUE)]
+  med <- median(pos$positivity, na.rm = TRUE)
+  pos[, log_gamma_t := pmin(pmax(-0.5 * (log(positivity) - log(med)),
+                                 -log(3)), log(3))]
+  out <- merge(out[, .(date)], pos[, .(date, log_gamma_t)],
+               by = "date", all.x = TRUE)
+  out[is.na(log_gamma_t), log_gamma_t := 0]
+  out
+}
+```
+
+# Load NYC MODZCTA Data
+
+```{r load_data}
+NY_WAVES <- WAVE_RUNS[state == "NY"]
+UT_WAVES <- WAVE_RUNS[state == "UT"]
+```
+
+```{r nyc_load, eval = nrow(NY_WAVES) > 0}
+## --- Weekly case rates (wide: week_ending x CASERATE_<modzcta>) ---
+nyc_raw <- fread(CONFIG$nyc_caserate_path)
+modzcta_cols <- grep("^CASERATE_[0-9]+$", names(nyc_raw), value = TRUE)
+
+nyc_long <- melt(nyc_raw, id.vars = "week_ending", measure.vars = modzcta_cols,
+                 variable.name = "modzcta_col", value.name = "case_rate")
+nyc_long[, modzcta := gsub("CASERATE_", "", modzcta_col)]
+nyc_long[, modzcta_col := NULL]
+nyc_long[, week_ending_date := mdy(week_ending)]
+nyc_long <- nyc_long[!is.na(week_ending_date) & !is.na(case_rate)]
+
+
+## --- CBG-to-MODZCTA crosswalk (for borough assignment) ---
+cbg_modzcta <- fread(CONFIG$nyc_crosswalk_path)
+cbg_modzcta[, modzcta := as.character(modzcta)]
+saveRDS(cbg_modzcta, file.path(CONFIG$cache_dir, "cbg_modzcta_crosswalk_NY.rds"))
+
+# Unique MODZCTA -> borough mapping (take first if multiple)
+modzcta_borough <- cbg_modzcta[, .(borough = borough[1]), by = modzcta]
+```
+
+# Process Each Period
+
+```{r process_periods, eval = nrow(NY_WAVES) > 0}
+process_nyc_wave <- function(wave_id, wave_months) {
+  wdr <- get_wave_date_range(wave_months)
+  out_dir <- get_wave_dir("NY", wave_id)
+  dir.create(file.path(out_dir, "tables"), recursive = TRUE, showWarnings = FALSE)
+
+  ## --- Filter weeks overlapping this wave (with 6-day pad on each side) ---
+  relevant <- nyc_long[week_ending_date >= (wdr$start - 6) &
+                       week_ending_date <= (wdr$end + 6)]
+
+  ## --- Weekly midpoints for smooth interpolation across the full 90-day window ---
+  midpoints <- relevant[, .(mid_date = week_ending_date - 3L, modzcta, case_rate)]
+  midpoints <- midpoints[, .(case_rate = mean(case_rate, na.rm = TRUE)),
+                         by = .(modzcta, mid_date)]
+  setorder(midpoints, modzcta, mid_date)
+
+  all_dates <- seq(wdr$start, wdr$end, by = "day")
+  daily <- rbindlist(lapply(unique(midpoints$modzcta), function(mz) {
+    mz_data <- midpoints[modzcta == mz]
+    if (nrow(mz_data) < 2L) {
+      return(data.table(modzcta = mz, date = all_dates,
+                        case_rate = mz_data$case_rate[1]))
+    }
+    interp <- approx(x = as.numeric(mz_data$mid_date),
+                     y = mz_data$case_rate,
+                     xout = as.numeric(all_dates),
+                     rule = 2)  # extrapolate nearest at edges
+    data.table(modzcta = mz, date = all_dates, case_rate = pmax(interp$y, 0))
+  }))
+  daily[, sim_day := as.integer(date - wdr$start) + 1L]
+  # Tag each day with its source month for diagnostic faceting downstream.
+  daily[, source_month := format(date, "%Y-%m")]
+
+  ## --- Borough assignment + spillover ---
+  daily[, borough := modzcta_borough[.SD, borough, on = .(modzcta)]]
+  daily[is.na(borough), borough := "Unknown"]
+
+  borough_rates <- daily[, .(borough_mean = mean(case_rate, na.rm = TRUE)),
+                         by = .(date, borough)]
+  daily[borough_rates, borough_mean := i.borough_mean, on = .(date, borough)]
+
+  alpha <- CONFIG$spillover_alpha
+  daily[, case_rate_spillover := alpha * case_rate + (1 - alpha) * borough_mean]
+  daily[is.na(case_rate_spillover), case_rate_spillover := case_rate]
+
+  ## --- Testing-adjustment γ_t ---
+  gamma_dt <- load_log_gamma_t("NY", unique(daily$date))
+  daily <- merge(daily, gamma_dt, by = "date", all.x = TRUE)
+  daily[is.na(log_gamma_t), log_gamma_t := 0]
+
+  ## --- Output (90 continuous sim_days) ---
+  out <- daily[, .(geo_id = modzcta, date, sim_day, source_month,
+                   case_rate, case_rate_spillover, borough, log_gamma_t)]
+  fwrite(out, file.path(out_dir, "tables", "case_rates.csv"))
+  out
+}
+
+results <- lapply(seq_len(nrow(NY_WAVES)), function(i) {
+  process_nyc_wave(NY_WAVES$wave_id[i], NY_WAVES$wave_months[[i]])
+})
+names(results) <- NY_WAVES$wave_id
+```
+
+# Utah Case Data (NYT Daily County Counts)
+
+```{r ut_load, eval = nrow(UT_WAVES) > 0}
+# Load NYT county-level daily cumulative counts for all years touched by waves
+ut_years <- unique(unlist(lapply(UT_WAVES$wave_months, function(ms) substr(ms, 1, 4))))
+nyt_raw <- rbindlist(lapply(ut_years, function(y) {
+  fp <- CONFIG$nyt_counties_files[[y]]
+  if (!file.exists(fp)) { return(NULL) }
+  fread(fp)
+}))
+# Filter to Utah
+ut_raw <- nyt_raw[state == "Utah" & !is.na(fips)]
+ut_raw[, fips := sprintf("%05d", as.integer(fips))]
+ut_raw[, date := as.Date(date)]
+setorder(ut_raw, fips, date)
+# Compute daily new cases from cumulative
+ut_raw[, new_cases := cases - data.table::shift(cases, 1, fill = 0), by = fips]
+ut_raw[new_cases < 0, new_cases := 0]  # handle data corrections
+
+# Redistribute batch-reported cases (Nash et al. 2023; Simpson et al. 2022)
+ut_raw <- redistribute_batch_cases(ut_raw[date >= as.Date("2020-10-01")],
+                                   id_col = "fips", cases_col = "new_cases") |>
+  rbind(ut_raw[date < as.Date("2020-10-01")]) |>
+  setorder(fips, date)
+
+
+# County population for rate calculation (from grid population CSV, year 2020 as baseline)
+# We'll use the CDC surveillance data to cross-check counts
+ut_cdc <- fread(CONFIG$ut_county_cases_path)
+ut_cdc <- ut_cdc[!is.na(county_fips_code)]
+```
+
+```{r ut_process, eval = nrow(UT_WAVES) > 0}
+process_ut_wave <- function(wave_id, wave_months) {
+  wdr <- get_wave_date_range(wave_months)
+  out_dir <- get_wave_dir("UT", wave_id)
+  dir.create(file.path(out_dir, "tables"), recursive = TRUE, showWarnings = FALSE)
+
+  # Filter NYT daily data to the full 90-day wave window
+  daily <- ut_raw[date >= wdr$start & date <= wdr$end]
+
+  # County population from wave's ACS year
+  pop_year <- UT_WAVES$acs_year[UT_WAVES$wave_id == wave_id][1]
+  pop_file <- file.path(CONFIG$grids_dir, sprintf("population_UT_%s.csv", pop_year))
+  grid_pop <- fread(pop_file)
+  grid_sf_path <- file.path(CONFIG$grids_dir, "grid_100m_UT.gpkg")
+
+  gsf <- sf::st_read(grid_sf_path, quiet = TRUE)
+  gdt <- data.table(grid_id = gsf$grid_id, fips_5 = gsf$fips_5)
+  gdt <- merge(gdt, grid_pop[, .(grid_id, population)], by = "grid_id", all.x = TRUE)
+  county_pop <- gdt[, .(population = sum(population, na.rm = TRUE)), by = fips_5]
+
+  # Merge population and compute rate per 100k
+  daily <- merge(daily, county_pop, by.x = "fips", by.y = "fips_5", all.x = TRUE)
+  daily[is.na(population) | population < 100, population := 100]
+  daily[, case_rate := new_cases / population * 1e5]
+  daily[, sim_day := as.integer(date - wdr$start) + 1L]
+  daily[, source_month := format(date, "%Y-%m")]
+
+  # Region assignment
+  daily[, region := county]
+
+  # Statewide spillover
+  state_mean <- daily[, .(state_mean = mean(case_rate, na.rm = TRUE)), by = date]
+  daily <- merge(daily, state_mean, by = "date", all.x = TRUE)
+  alpha <- CONFIG$spillover_alpha
+  daily[, case_rate_spillover := alpha * case_rate + (1 - alpha) * state_mean]
+  daily[is.na(case_rate_spillover), case_rate_spillover := case_rate]
+
+  ## --- Testing-adjustment γ_t ---
+  gamma_dt <- load_log_gamma_t("UT", unique(daily$date))
+  daily <- merge(daily, gamma_dt, by = "date", all.x = TRUE)
+  daily[is.na(log_gamma_t), log_gamma_t := 0]
+
+  out <- daily[, .(geo_id = fips, date, sim_day, source_month,
+                   new_cases, case_rate, case_rate_spillover, region, log_gamma_t)]
+  fwrite(out, file.path(out_dir, "tables", "case_rates.csv"))
+  out
+}
+
+ut_results <- lapply(seq_len(nrow(UT_WAVES)), function(i) {
+  process_ut_wave(UT_WAVES$wave_id[i], UT_WAVES$wave_months[[i]])
+})
+names(ut_results) <- UT_WAVES$wave_id
+```
+
+# Summary
+
+```{r summary}
+all_results <- c(
+  if (exists("results")) results else list(),
+  if (exists("ut_results")) ut_results else list()
+)
+for (wid in names(all_results)) {
+  dt <- all_results[[wid]]
+}
+```

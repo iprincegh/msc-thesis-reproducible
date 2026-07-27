@@ -1,0 +1,765 @@
+---
+title: "09 - Unified Component Model (Transport-Augmented Adjacency)"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+source(here::here("helpers/_utils.R"))
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE,
+  fig.width = 12, fig.height = 8
+)
+```
+
+## Setup
+
+```{r load}
+load_pipeline()
+library(data.table)
+library(INLA)
+library(sf)
+library(spdep)
+
+# Suppress macOS MallocStackLogging noise from INLA child processes
+Sys.unsetenv("MallocStackLogging")
+local({
+  hook <- knitr::knit_hooks$get("message")
+  knitr::knit_hooks$set(message = function(x, options) {
+    x <- gsub("(?m)^.*MallocStackLogging.*\\n?", "", x, perl = TRUE)
+    if (!nzchar(trimws(x))) {
+      return(invisible(NULL))
+    }
+    hook(x, options)
+  })
+})
+
+# Raise R vector-heap ceiling where supported (helps large-model RAM usage).
+mem.maxVSize(vsize = Inf)
+
+# Conservative defaults; per-model and cluster overrides occur inside the
+# fit loop or via environment variables on the cluster.
+inla.setOption(num.threads = "1:2")
+# Use compact INLA mode for lower memory usage on large separable space-time models.
+inla.setOption(inla.mode = "compact")
+```
+
+## Configuration
+
+```{r config}
+# Shared constants and preprocessing functions are defined in _utils.R
+
+RHO_TRIM_LOW <- 0.001
+RHO_TRIM_HIGH <- 50
+
+RUN_STATES <- unique(WAVE_RUNS$state)
+
+.fit_state <- Sys.getenv("fit_state", unset = "")
+.fit_wave <- Sys.getenv("fit_wave", unset = "")
+if (nzchar(.fit_state) && nzchar(.fit_wave)) {
+  WAVE_RUNS <- WAVE_RUNS[WAVE_RUNS$state == .fit_state &
+    WAVE_RUNS$wave_id == .fit_wave, , drop = FALSE]
+  RUN_STATES <- .fit_state
+}
+
+# HPC / Environment Overrides
+# Environment variables may override these defaults when running on an HPC
+# system. Defaults below let the script run locally without cluster config.
+
+# Threading. Read inline by the fit loop via Sys.getenv("fit_num_threads")
+# and used to override the local-tuned "1:2". SLURM wrapper sets this to
+# e.g. "4:9" (4 outer x 9 inner = 36 cores on a Skylake/bigsmp node)
+# or "9:4" / "12:8" on zen4.
+
+# CPO/PIT toggle. Enable via `fit_full_cpo=1` on large nodes to compute
+# LOO predictive densities alongside WAIC/DIC.
+.fit_full_cpo <- identical(Sys.getenv("fit_full_cpo"), "1")
+
+# K-means cluster count for the Knorr-Held Type IV interaction.
+# Set a sensible local default so the script is runnable without cluster env vars.
+N_ST_CLUSTERS <- 40L
+.fit_n_clusters <- suppressWarnings(as.integer(Sys.getenv("fit_n_st_clusters", unset = "")))
+if (length(.fit_n_clusters) && !is.na(.fit_n_clusters) && .fit_n_clusters > 0) {
+  N_ST_CLUSTERS <- .fit_n_clusters
+  message(sprintf("[fit-cfg] N_ST_CLUSTERS = %d", N_ST_CLUSTERS))
+}
+
+# Latent strategy + integration grid. Setting fit_full_quality=1
+# bumps INLA from EB + h=0.005 to CCD hyperpar integration with the
+# tighter h=0.001 grid step — gives full hyperpar posterior uncertainty
+# instead of the EB point estimate plug-in.
+# full-quality hyperpar integration (cluster override)
+.fit_full_quality <- identical(Sys.getenv("fit_full_quality"), "1")
+if (.fit_full_quality) {
+  options(
+    fit_int_strategy = "ccd", fit_h_val = 0.001,
+    fit_diff_logdens = 4
+  )
+  message("[fit-cfg] fit_full_quality=1 -> int.strategy=ccd, h=0.001, diff.logdens=4")
+}
+
+# Newton outer-iteration cap (override via `fit_max_iter` env var)
+.fit_max_iter <- suppressWarnings(as.integer(Sys.getenv("fit_max_iter", unset = "")))
+if (length(.fit_max_iter) && !is.na(.fit_max_iter) && .fit_max_iter > 0) {
+  options(fit_max_iter = .fit_max_iter)
+  message(sprintf("[fit-cfg] fit_max_iter = %d", .fit_max_iter))
+}
+
+# Optional wave-specific exclusions by grid_id.
+EXCLUDE_COUNTIES <- list()
+
+SNAP_QUEEN <- 10
+SNAP_TIERS <- c(300, 500, 750, 1000, 1500)
+SNAP_MAX <- 2000
+
+OD_CORR_THRESHOLD <- 0.6
+OD_MIN_ACTIVITY <- 5.0
+OD_MIN_DAYS <- 10
+OD_MIN_ROWS <- 1000
+OD_MAX_FRAG_SIZE <- 10
+OD_MAX_FRAG_DEGREE <- 1.5
+MAX_WORMHOLES <- 10
+
+# Drop grids with fewer than `MIN_WAVE_CASES` cases for the wave.
+# This reduces structural-zero cells and keeps the dataset compact.
+MIN_WAVE_CASES <- 1L
+
+TIGER_BRIDGE_TYPES <- c("S1100", "S1200")
+
+configure_state <- function(st) {
+  state <<- st
+  if (st == "NY") {
+    BRIDGE_CSV <<- CONFIG$bridge_csv
+    SUBWAY_ROUTES_SHP <<- CONFIG$subway_routes_shp
+    SUBWAY_STATIONS_CSV <<- CONFIG$subway_stations_csv
+    ROAD_SHP <<- CONFIG$ny_roads_shp
+  } else {
+    BRIDGE_CSV <<- ""
+    SUBWAY_ROUTES_SHP <<- ""
+    SUBWAY_STATIONS_CSV <<- ""
+    ROAD_SHP <<- ""
+  }
+  if (file.exists(BRIDGE_CSV)) {
+    bridges <- fread(BRIDGE_CSV, na.strings = c("", "NA"))
+    setnames(bridges, c("X - COORD  (LAT)", "Y - COORD   (LON)"),
+      c("lat", "lon"),
+      skip_absent = TRUE
+    )
+    bridge_links <<- bridges[nchar(BORO) >= 2 & !is.na(lat) & !is.na(lon)]
+  } else {
+    bridge_links <<- data.table(lat = numeric(), lon = numeric())
+  }
+  WORMHOLES <<- if (st == "NY") NYC_WORMHOLES else UT_WORMHOLES
+}
+```
+
+## Adjacency Builder
+
+Graph utilities, wormhole definitions, and `build_augmented_adjacency()` are in `_adjacency.R`.
+
+```{r adjacency_source}
+source("helpers/_adjacency.R")
+```
+
+## Unified Data
+
+```{r unified_data}
+# Helper: timestamped progress log
+log_msg <- function(...) {
+  cat(sprintf("[%s] ", format(Sys.time(), "%H:%M:%S")), ..., "\n", sep = "")
+  flush.console()
+}
+
+create_unified_data <- function(gt_dt, out_dir) {
+  log_msg("Loading grid_sf and building adjacency")
+  grid_sf <- st_read(file.path(CONFIG$grids_dir, sprintf("grid_100m_%s.gpkg", state)), quiet = TRUE)
+  grid_sf <- grid_sf[grid_sf$grid_id %in% unique(gt_dt$grid_id), ]
+  log_msg("grid_sf:", nrow(grid_sf), "cells")
+
+  # Drop grids with fewer than `MIN_WAVE_CASES` total cases for the wave.
+  # These structural-zero cells add work without contributing signal; the
+  # adjacency and graph components are rebuilt on the kept subset.
+  if (MIN_WAVE_CASES > 0) {
+    wave_totals <- gt_dt[, .(total_Y = sum(Y, na.rm = TRUE)), by = grid_id]
+    keep_ids <- wave_totals[total_Y >= MIN_WAVE_CASES, grid_id]
+    n_drop <- nrow(wave_totals) - length(keep_ids)
+    if (n_drop > 0) {
+      log_msg("Dropping ", n_drop, "/", nrow(wave_totals), " grids (<", MIN_WAVE_CASES, "cases)")
+      gt_dt <- gt_dt[grid_id %in% keep_ids]
+      grid_sf <- grid_sf[grid_sf$grid_id %in% keep_ids, ]
+      log_msg("grid_sf after filter:", nrow(grid_sf), "cells,", fmt(nrow(gt_dt)), "obs")
+    }
+  }
+
+  aug <- build_augmented_adjacency(grid_sf, bridge_links, WORMHOLES, gt_dt = gt_dt)
+  nb_aug <- aug$nb
+
+  # BYM2 requires a single connected augmented adjacency. If augmentation
+  # yields multiple components abort so the operator can inspect and fix it.
+  comp_check <- safe_n_comp_nb(nb_aug)
+  log_msg("components after augmentation:", comp_check$nc)
+  if (comp_check$nc > 1) {
+    cs <- sort(table(comp_check$comp.id), decreasing = TRUE)
+    isolated_ids <- grid_sf$grid_id[comp_check$comp.id != as.integer(names(cs)[1])]
+    stop(
+      sprintf(
+        "Augmented adjacency for %s_%s has %d components (sizes: %s). ",
+        state, basename(out_dir), comp_check$nc,
+        paste(as.integer(cs), collapse = ", ")
+      ),
+      "BYM2 requires a single connected graph. ",
+      sprintf(
+        "Inspect %d isolated grid_id(s) (first 20): %s. ",
+        length(isolated_ids),
+        paste(head(isolated_ids, 20), collapse = ", ")
+      ),
+      "Add bridges/wormholes in helpers/_adjacency.R or extend SNAP_TIERS, then re-run."
+    )
+  }
+
+  graph_file <- file.path(out_dir, "models", "grid_adj_unified.graph")
+  safe_nb2INLA(graph_file, nb_aug)
+  log_msg("wrote", basename(graph_file))
+
+  n_grids <- length(unique(grid_sf$grid_id))
+  n_days <- uniqueN(gt_dt$time_id)
+
+  df <- gt_dt[order(grid_id, time_id)]
+  gi <- data.table(grid_id = sort(unique(df$grid_id)), idx_spatial = seq_len(uniqueN(df$grid_id)))
+  if ("idx_spatial" %in% names(df)) df[, idx_spatial := NULL]
+  # Assign `idx_spatial` by matching to avoid an extra large merge copy.
+  df[, idx_spatial := gi$idx_spatial[match(grid_id, gi$grid_id)]]
+  df[, idx_temporal := as.integer(factor(time_id))]
+  df[, idx_interaction := .I]
+
+  # coarsened ST clusters
+  if (n_grids > 300) {
+    co <- st_coordinates(suppressWarnings(st_centroid(grid_sf)))
+    set.seed(42)
+    # Choose number of ST clusters (≈1 per 100 grids), capped at N_ST_CLUSTERS.
+    nc <- min(N_ST_CLUSTERS, round(n_grids / 100))
+    log_msg("building cluster graph:", nc, "clusters from", n_grids, "grids")
+    cl_vec <- kmeans(co, nc, nstart = 3)$cluster
+    cl <- data.table(grid_id = grid_sf$grid_id, idx_st_cluster = cl_vec)
+    df <- merge(df, cl, by = "grid_id", all.x = TRUE)
+
+    # Build cluster adjacency from augmented nb
+    edge_list <- lapply(seq_along(nb_aug), function(i) {
+      ni <- nb_aug[[i]]
+      ni <- ni[ni > 0L]
+      if (length(ni) == 0L) {
+        return(NULL)
+      }
+      data.table(a = cl_vec[i], b = cl_vec[ni])
+    })
+    edge_list <- Filter(Negate(is.null), edge_list)
+    if (length(edge_list) > 0) {
+      cl_edges <- unique(rbindlist(edge_list))
+      cl_edges <- cl_edges[a != b]
+    } else {
+      cl_edges <- data.table(a = integer(), b = integer())
+    }
+    nb_cl <- lapply(seq_len(nc), function(i) {
+      nbs <- sort(unique(cl_edges[a == i, b]))
+      if (length(nbs) == 0) 0L else as.integer(nbs)
+    })
+    class(nb_cl) <- "nb"
+    attr(nb_cl, "region.id") <- as.character(seq_len(nc))
+    cluster_graph <- file.path(out_dir, "models", "cluster_adj_unified.graph")
+    safe_nb2INLA(cluster_graph, nb_cl)
+  } else {
+    log_msg("small domain:", n_grids, "grids; cluster_graph = grid_graph")
+    df[, idx_st_cluster := idx_spatial]
+    cluster_graph <- file.path(out_dir, "models", "cluster_adj_unified.graph")
+    file.copy(graph_file, cluster_graph, overwrite = TRUE)
+  }
+
+  df[!is.finite(idx_st_cluster), idx_st_cluster := 1L]
+  df[, idx_st_cluster := as.integer(idx_st_cluster)]
+
+  list(
+    df = as.data.frame(df), graph_file = graph_file, n_grids = max(df$idx_spatial),
+    n_days = max(df$idx_temporal), grid_index = gi, grid_sf = grid_sf,
+    nb = nb_aug, augmentation = aug, cluster_graph = cluster_graph
+  )
+}
+```
+
+## Data Stabilization & Preprocessing
+
+`stabilize_offsets()`, `add_spatial_orthogonalization()`, `add_temporal_centering()`,
+`add_temporal_lags()`, `add_rho_bins()`, `select_mob_lags()`,
+`fit_model()`, `extract_model_outputs()`, and `select_covariates()` are in `_utils.R`.
+
+```{r stabilize}
+stabilize_data <- function(df) {
+  has <- function(x) x %in% names(df)
+
+  rho_col <- if (has("rho_norm")) "rho_norm" else if (has("rho")) "rho" else NULL
+  if (!is.null(rho_col)) {
+    df[[rho_col]] <- pmax(pmin(df[[rho_col]], RHO_TRIM_HIGH), RHO_TRIM_LOW)
+    if (!has("log_rho")) df$log_rho <- log(df[[rho_col]])
+    if (!has("log_rho_std")) {
+      m <- mean(df$log_rho, na.rm = TRUE)
+      s <- sd(df$log_rho, na.rm = TRUE)
+      df$log_rho_std <- if (s > 1e-10) (df$log_rho - m) / s else 0
+    }
+  }
+
+  if (!has("offset_total")) {
+    if (has("E_inla")) {
+      df$offset_total <- log(pmax(df$E_inla, 1e-10))
+    } else if (has("pop_weight")) {
+      df$offset_total <- log(pmax(df$pop_weight, 1e-10))
+    } else {
+      df$offset_total <- 0
+    }
+  }
+
+  if (has("contact_intensity") && !has("contact_intensity_std")) {
+    s <- sd(df$contact_intensity, na.rm = TRUE)
+    df$contact_intensity_std <- if (s > 1e-10) scale(df$contact_intensity)[, 1] else 0
+  }
+
+  df <- stabilize_offsets(df)
+  df <- add_rho_bins(df)
+  df
+}
+```
+
+## Main Fitting
+
+```{r fit_unified}
+fit_unified <- function(wave_id, wave_label = NULL) {
+  label <- wave_label %||% CONFIG$waves[[wave_id]]$label %||% wave_id
+
+  log_msg(strrep("=", 78))
+  log_msg("WAVE START:", state, "_", wave_id, "(", label, ")")
+  log_msg(strrep("=", 78))
+  t_wave <- Sys.time()
+
+  out_dir <- file.path(CONFIG$output_dir, paste0(state, "_", wave_id))
+  dir.create(file.path(out_dir, "models"), recursive = TRUE, showWarnings = FALSE)
+  dir.create(file.path(out_dir, "tables"), recursive = TRUE, showWarnings = FALSE)
+
+  log_msg("Loading model_data_gt.rds")
+  md_raw <- readRDS(file.path(out_dir, "models", "model_data_gt.rds"))
+  gt_dt <- copy(md_raw$gt_dt)
+  # Free the original wave-data wrapper. `gt_dt` is an independent deep copy
+  # (data.table::copy), so dropping md_raw releases ~1 GB of duplicate rows.
+  rm(md_raw)
+  gc(full = TRUE)
+  log_msg(
+    "gt_dt:", format(nrow(gt_dt), big.mark = ","), "rows |",
+    uniqueN(gt_dt$grid_id), "grids |", uniqueN(gt_dt$time_id), "days"
+  )
+
+  # Exclude flagged batch-reporting counties
+  exc_key <- paste0(state, "_", wave_id)
+  exc_ids <- EXCLUDE_COUNTIES[[exc_key]]
+  if (!is.null(exc_ids)) {
+    n_before <- uniqueN(gt_dt$grid_id)
+    gt_dt <- gt_dt[!grid_id %in% exc_ids]
+    log_msg(
+      "Excluded counties:", paste(exc_ids, collapse = ","),
+      "; dropped", n_before - uniqueN(gt_dt$grid_id), "grids"
+    )
+  }
+
+  subset <- create_unified_data(gt_dt, out_dir)
+  rm(gt_dt)
+  gc(full = TRUE)
+
+  df <- stabilize_data(subset$df)
+  subset$df <- NULL
+  subset$nb <- NULL
+  gc(full = TRUE)
+  log_msg(
+    "E_inla range:[", sprintf("%.4g", min(df$E_inla, na.rm = TRUE)),
+    ",", sprintf("%.4g", max(df$E_inla, na.rm = TRUE)), "]",
+    " log_rho:[", sprintf("%.3f", min(df$log_rho, na.rm = TRUE)),
+    ",", sprintf("%.3f", max(df$log_rho, na.rm = TRUE)), "]"
+  )
+
+  disp <- var(df$Y, na.rm = TRUE) / max(mean(df$Y, na.rm = TRUE), 0.01)
+  zero_frac <- mean(df$Y == 0, na.rm = TRUE)
+  avail <- select_covariates(df, POTENTIAL_COVARIATES)
+  # Family is auto-decided downstream by fit_model (Poisson if disp<1.1,
+  # else NegBin). Echo the decision here so the per-wave log is unambiguous.
+  fam_chosen <- if (disp < 1.1) "Poisson" else "NegBin"
+  log_msg(
+    "disp=", sprintf("%.2f", disp),
+    " zero_frac=", sprintf("%.3f", zero_frac),
+    " covariates=", length(avail), "/", length(POTENTIAL_COVARIATES),
+    " family=", fam_chosen
+  )
+
+  df <- df |>
+    add_spatial_orthogonalization(subset$grid_sf) |>
+    add_temporal_lags() |>
+    add_temporal_centering()
+  # grid_sf (large polygon collection with geometry column) is only needed for
+  # spatial orthogonalisation. Free now so it doesn't sit through 6 INLA fits.
+  subset$grid_sf <- NULL
+  gc(full = TRUE)
+
+  flags <- detect_flags(df)
+  log_msg(
+    "flags: rho=", flags$rho, " contact=", flags$contact,
+    " exposure_import=", flags$exposure_import,
+    " spatial_lag=", flags$spatial_lag
+  )
+  fms <- build_formulas(avail, subset$graph_file, flags, disp, subset$cluster_graph, subset$n_grids,
+    state = state, wave_id = wave_id
+  )
+  log_msg("formulas:", length(fms), "variants")
+
+  diagnose_prefit(df, subset$cluster_graph)
+
+  if (any(grepl("ST", names(fms)))) {
+    merge_res <- merge_degenerate_clusters(df, subset$cluster_graph)
+    if (merge_res$changed) {
+      log_msg("merge_degenerate_clusters: graph changed; rebuilding formulas")
+      df <- merge_res$df
+      fms <- build_formulas(avail, subset$graph_file, flags, disp, subset$cluster_graph, subset$n_grids,
+        state = state, wave_id = wave_id
+      )
+    }
+  }
+
+  # Select mobility lags: keep lags within 50% of peak correlation.
+  # This allows multiple lags when the CCF is multimodal.
+  best_lags <- select_mob_lags(df)
+
+  # Negative-control: future mobility (mob_lag_neg = lead by 7d). Added
+  # alongside real lags so its posterior beta serves as a falsification test.
+  m1_extras <- c(best_lags, intersect(c("exposure_import_std", "mob_lag_neg"), names(df)))
+  m1_extras <- m1_extras[sapply(m1_extras, function(v) sd(df[[v]], na.rm = TRUE) > 0.01)]
+  log_msg(
+    "selected mob lags:", paste(best_lags, collapse = ", "),
+    " extras:", paste(m1_extras, collapse = ", ")
+  )
+  if (length(m1_extras) > 0) {
+    mob_models <- intersect(MOB_MODELS, names(fms))
+    for (mn in mob_models) {
+      fms[[mn]] <- update(fms[[mn]], as.formula(paste("~ . +", paste(m1_extras, collapse = " + "))))
+    }
+  }
+
+  ckpt_dir_m <- file.path(out_dir, "models", "ckpt")
+  ckpt_dir_t <- file.path(out_dir, "tables", "ckpt")
+  dir.create(ckpt_dir_m, recursive = TRUE, showWarnings = FALSE)
+  dir.create(ckpt_dir_t, recursive = TRUE, showWarnings = FALSE)
+
+  refit_now <- if (identical(Sys.getenv("fit_force_refit"), "1")) {
+    names(fms)
+  } else {
+    character(0)
+  }
+  if (length(refit_now) > 0) {
+    log_msg("FORCE_REFIT:", wave_id, ":", paste(refit_now, collapse = ", "))
+    for (mn in refit_now) {
+      for (suf in c(".rds", "_comp.rds", "_conv.rds", "_mode.rds")) {
+        f <- file.path(
+          if (suf == ".rds") ckpt_dir_m else ckpt_dir_t,
+          paste0(mn, suf)
+        )
+        if (file.exists(f)) {
+          file.remove(f)
+          log_msg("invalidated", f)
+        }
+      }
+    }
+  }
+
+  .cpo_flag <- identical(Sys.getenv("fit_full_cpo"), "1")
+
+  outputs <- list()
+  comp <- data.table()
+  conv_log <- list()
+  E_vec <- NULL
+  for (i in seq_along(fms)) {
+    mn <- names(fms)[i]
+    ckpt_out <- file.path(ckpt_dir_m, paste0(mn, ".rds"))
+    ckpt_comp <- file.path(ckpt_dir_t, paste0(mn, "_comp.rds"))
+    ckpt_conv <- file.path(ckpt_dir_t, paste0(mn, "_conv.rds"))
+
+    if (file.exists(ckpt_comp) &&
+      !identical(Sys.getenv("fit_force_refit"), "1")) {
+      log_msg(sprintf("[%d/%d] %-15s RESUME (checkpoint)", i, length(fms), mn))
+      cr <- readRDS(ckpt_comp)
+      comp <- rbind(comp, cr, fill = TRUE)
+      if (file.exists(ckpt_conv)) conv_log[[mn]] <- readRDS(ckpt_conv)
+      next
+    }
+
+    E_vec <- get_E(mn, df)
+    log_msg(sprintf("[%d/%d] %-15s ...", i, length(fms), mn))
+
+    warmstart_theta <- NULL
+    warmstart_parent <- c(LinMob_ST_IV = "LinMob", NLMob = "LinMob", NLMob_ST_IV = "NLMob")
+    if (identical(Sys.getenv("fit_force_warmstart"), "1") && mn %in% names(warmstart_parent)) {
+      sibling_mode <- file.path(ckpt_dir_t, paste0(warmstart_parent[[mn]], "_mode.rds"))
+      if (file.exists(sibling_mode)) {
+        warmstart_theta <- readRDS(sibling_mode)
+      }
+    }
+
+    threads_this <- if (nzchar(Sys.getenv("fit_num_threads", unset = ""))) {
+      Sys.getenv("fit_num_threads")
+    } else {
+      "1:2"
+    }
+    inla.setOption(num.threads = threads_this)
+
+    fit <- fit_model(fms[[mn]], df, E_vec, paste0(mn, ": ", MODEL_LABELS[[mn]]), zero_frac, disp,
+      cpo = .cpo_flag, config = FALSE, n_grids = subset$n_grids,
+      warmstart_theta = warmstart_theta
+    )
+    waic_v <- if (!is.null(fit$result)) fit$result$waic$waic else NA_real_
+    log_msg(sprintf(
+      "[%d/%d] %-15s %s (%.1f min, WAIC=%s)",
+      i, length(fms), mn, fit$status, fit$runtime,
+      if (is.na(waic_v)) "NA" else format(round(waic_v), big.mark = ",")
+    ))
+
+    fit_rmse <- fit_mae <- fit_r2 <- fit_cor <- NA_real_
+    if (!is.null(fit$result)) {
+      mu <- fit$result$summary.fitted.values$mean
+      y <- df$Y
+      fit_rmse <- sqrt(mean((y - mu)^2, na.rm = TRUE))
+      fit_mae <- mean(abs(y - mu), na.rm = TRUE)
+      ss_res <- sum((y - mu)^2, na.rm = TRUE)
+      ss_tot <- sum((y - mean(y))^2, na.rm = TRUE)
+      fit_r2 <- if (ss_tot > 0) 1 - ss_res / ss_tot else NA_real_
+      fit_cor <- cor(y, mu, use = "complete.obs")
+    }
+
+    conv_row <- NULL
+    if (!is.null(fit$convergence)) {
+      conv_row <- data.table(
+        Model = mn,
+        mlik_int = fit$convergence$mlik_int,
+        mlik_gauss = fit$convergence$mlik_gauss,
+        mode_status = fit$convergence$mode_status,
+        n_hyperpar = fit$convergence$n_hyperpar,
+        cpu_total_s = fit$convergence$cpu_total_s,
+        max_fitted = fit$convergence$max_fitted,
+        status = fit$status,
+        runtime_min = fit$runtime
+      )
+      conv_log[[mn]] <- conv_row
+    }
+
+    comp_row <- data.table(
+      Model = mn, Description = MODEL_LABELS[[mn]],
+      WAIC = if (!is.null(fit$result)) fit$result$waic$waic else NA,
+      DIC = if (!is.null(fit$result)) fit$result$dic$dic else NA,
+      pD = if (!is.null(fit$result)) fit$result$dic$p.eff else NA,
+      RMSE = fit_rmse, MAE = fit_mae, R2 = fit_r2, Correlation = fit_cor,
+      Runtime = fit$runtime, Status = fit$status
+    )
+    comp <- rbind(comp, comp_row, fill = TRUE)
+
+    # persist comparison row before extracting outputs
+    saveRDS(comp_row, ckpt_comp)
+    if (!is.null(conv_row)) saveRDS(conv_row, ckpt_conv)
+
+    if (fit$status == "OK") {
+      mo <- extract_model_outputs(fit$result, df, subset$grid_index, mn, E_vec)
+      saveRDS(mo, ckpt_out)
+      ws_theta <- fit$result$mode$theta
+      if (is.null(ws_theta) && !is.null(fit$result$summary.hyperpar)) {
+        ws_theta <- fit$result$summary.hyperpar$mode
+      }
+      if (!is.null(ws_theta) && length(ws_theta) > 0) {
+        saveRDS(ws_theta, file.path(ckpt_dir_t, paste0(mn, "_mode.rds")))
+        log_msg(sprintf("[%d/%d] %-15s saved theta (%d)", i, length(fms), mn, length(ws_theta)))
+      } else {
+        log_msg(sprintf("[%d/%d] %-15s WARNING: no theta mode", i, length(fms), mn))
+      }
+      ws_x <- fit$result$mode$x
+      if (!is.null(ws_x) && length(ws_x) > 0) {
+        saveRDS(ws_x, file.path(ckpt_dir_t, paste0(mn, "_xmode.rds")))
+        log_msg(sprintf("[%d/%d] %-15s saved xmode (len %d)", i, length(fms), mn, length(ws_x)))
+      }
+      rm(mo)
+    }
+    rm(fit)
+    gc(full = TRUE)
+    gc(full = TRUE)
+  }
+
+  # Reload OK models' outputs from disk (single pass).
+  ok_models <- comp[Status == "OK", Model]
+  for (mn in ok_models) {
+    pth <- file.path(ckpt_dir_m, paste0(mn, ".rds"))
+    if (file.exists(pth)) {
+      log_msg("reloading", mn, "outputs from ckpt")
+      outputs[[mn]] <- readRDS(pth)
+    }
+  }
+
+  # model comparison
+  ok <- comp[Status == "OK"]
+  best_model <- NA
+  if (nrow(ok) > 0) {
+      if (all(is.na(ok$WAIC))) {
+      ok[, dWAIC := NA_real_]
+    } else {
+      ok[, dWAIC := WAIC - min(WAIC, na.rm = TRUE)]
+    }
+    if (all(is.na(ok$DIC))) {
+      ok[, dDIC := NA_real_]
+    } else {
+      ok[, dDIC := DIC - min(DIC, na.rm = TRUE)]
+    }
+    comp[Status == "OK", `:=`(dWAIC = ok$dWAIC, dDIC = ok$dDIC)]
+    print(ok[order(WAIC), .(Model,
+      WAIC = round(WAIC, 0), dWAIC = round(dWAIC, 1),
+      DIC = round(DIC, 0), dDIC = round(dDIC, 1),
+      RMSE = round(RMSE, 2), MAE = round(MAE, 2),
+      R2 = round(R2, 4), Cor = round(Correlation, 4),
+      pD = round(pD, 0), Time = round(Runtime, 1)
+    )])
+    if (!all(is.na(ok$WAIC))) {
+      best_model <- ok[which.min(WAIC), Model]
+    }
+  }
+
+  # Reorder rows by canonical increasing-complexity order (matches MODEL_LABELS).
+  comp[, Model := factor(Model, levels = names(MODEL_LABELS))]
+  setorder(comp, Model)
+  comp[, Model := as.character(Model)]
+  col_order <- intersect(
+    c(
+      "Model", "Description", "WAIC", "dWAIC", "DIC", "dDIC",
+      "pD", "RMSE", "MAE", "R2", "Correlation",
+      "Runtime", "Status"
+    ),
+    names(comp)
+  )
+  setcolorder(comp, col_order)
+
+  aug_lite <- subset$augmentation
+  aug_lite$nb <- NULL
+  final <- list(
+    state = state, wave_id = wave_id, wave_label = label,
+    comparison = comp, best_model = best_model,
+    dispersion = disp, zero_frac = zero_frac, n_grids = subset$n_grids,
+    n_days = subset$n_days, n_obs = nrow(df), augmentation = aug_lite,
+    model_outputs = outputs, grid_index = subset$grid_index
+  )
+
+  saveRDS(final, file.path(out_dir, "models", "model_results_unified.rds"))
+  fwrite(comp, file.path(out_dir, "tables", "model_comparison_unified.csv"))
+  if (length(conv_log) > 0) {
+    fwrite(
+      rbindlist(conv_log, fill = TRUE),
+      file.path(out_dir, "tables", "model_convergence_unified.csv")
+    )
+  }
+  b <- outputs[[best_model]]
+  if (!is.null(b)) {
+    for (tbl in c("fixed_effects", "spatial_effects", "temporal_effects", "fitted_values")) {
+      fwrite(b[[tbl]], file.path(out_dir, "tables", paste0("unified_", tbl, ".csv")))
+    }
+
+    best_fit_pth <- file.path(out_dir, "models", "best_model.rds")
+    saveRDS(
+      list(
+        name = best_model,
+        wave_label = label,
+        state = state,
+        wave_id = wave_id,
+        dispersion = disp,
+        zero_frac = zero_frac,
+        outputs = b
+      ),
+      best_fit_pth
+    )
+    writeLines(best_model, file.path(out_dir, "models", "best_model.txt"))
+    log_msg(sprintf("saved best model artifact: %s (%s)", best_fit_pth, best_model))
+  }
+
+  slim_return <- list(
+    state = state, wave_id = wave_id, wave_label = label,
+    comparison = comp, best_model = best_model,
+    dispersion = disp, zero_frac = zero_frac,
+    n_grids = subset$n_grids, n_days = subset$n_days,
+    n_obs = nrow(df)
+  )
+  rm(outputs, df, E_vec, subset, final, b)
+  gc(full = TRUE)
+  gc(full = TRUE)
+
+  elapsed <- as.numeric(difftime(Sys.time(), t_wave, units = "mins"))
+  log_msg(sprintf(
+    "WAVE DONE: %s_%s best=%s total=%.1f min",
+    state, wave_id, best_model %||% "NA", elapsed
+  ))
+
+  log_msg(strrep("=", 78))
+  slim_return
+}
+```
+
+## Run All
+
+```{r run_all}
+all_results <- list()
+t_run <- Sys.time()
+log_msg(strrep("#", 78))
+log_msg("PIPELINE START:", paste(RUN_STATES, collapse = ", "))
+log_msg(strrep("#", 78))
+
+for (st in intersect(RUN_STATES, unique(WAVE_RUNS$state))) {
+  configure_state(st)
+  st_waves <- WAVE_RUNS[WAVE_RUNS$state == st, ]
+  log_msg("STATE", st, "->", paste(st_waves$wave_id, collapse = ", "))
+  for (i in 1:nrow(st_waves)) {
+    wid <- st_waves$wave_id[i]
+    res <- fit_unified(wid)
+    all_results[[paste0(st, "_", wid)]] <- res[c(
+      "state", "wave_id", "wave_label",
+      "comparison", "best_model", "n_grids", "n_days", "n_obs"
+    )]
+    rm(res)
+    gc(full = TRUE)
+  }
+}
+
+elapsed_total <- as.numeric(difftime(Sys.time(), t_run, units = "mins"))
+log_msg(strrep("#", 78))
+log_msg(sprintf(
+  "PIPELINE DONE: %d waves total=%.1f min",
+  length(all_results), elapsed_total
+))
+log_msg(strrep("#", 78))
+```
+
+## Summary
+
+```{r summary}
+for (nm in names(all_results)) {
+  r <- all_results[[nm]]
+  if (is.null(r)) next
+  ok <- r$comparison[Status == "OK"]
+  log_msg(sprintf(
+    "=== %s (%s) ===  best=%s  n_grids=%d  n_days=%d  n_obs=%s",
+    nm, r$wave_label, r$best_model %||% "NA",
+    r$n_grids, r$n_days, format(r$n_obs, big.mark = ",")
+  ))
+  print(ok[order(WAIC), .(Model,
+    WAIC = round(WAIC, 0), dWAIC = round(dWAIC, 1),
+    DIC = round(DIC, 0), dDIC = round(dDIC, 1),
+    RMSE = round(RMSE, 2), R2 = round(R2, 4),
+    Time = round(Runtime, 1)
+  )])
+}
+```

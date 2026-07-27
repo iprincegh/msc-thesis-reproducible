@@ -1,0 +1,835 @@
+---
+title: "04 - Mobility Data Diagnostics"
+author: "Prince Oppong Boakye"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+source(here::here("helpers/_utils.R"))
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 14, fig.height = 8)
+```
+
+# Overview
+
+Visualizes grid-level mobility outputs from 03 (Advan extraction).
+No data transformations — purely diagnostic maps and distributions.
+
+```{r init}
+load_pipeline()
+library(data.table); library(sf); library(arrow)
+library(ggplot2); library(viridis); library(ggspatial); library(patchwork)
+
+states <- unique(WAVE_RUNS$state)
+spatial_data <- load_spatial(states)
+
+# Pre-load wave-level grid_visits feathers (one per state x wave).
+# Defensive dedupe by (wave_id, grid_id): some upstream feathers can carry
+# duplicate grid_id rows, which would cause cartesian merges and overplotted maps.
+visits_by_state <- setNames(lapply(states, function(state) {
+  .this_state <- state
+  st_waves <- WAVE_RUNS[which(WAVE_RUNS$state == .this_state), ]
+  dt <- rbindlist(lapply(st_waves$wave_id, function(wid) {
+    fp <- file.path(get_wave_dir(state, wid), "intermediate", "grid_visits.feather")
+    if (!file.exists(fp)) return(NULL)
+    d <- as.data.table(read_feather(fp))
+    d[, wave_id := wid]
+  }), fill = TRUE)
+  n_dup <- nrow(dt) - nrow(unique(dt, by = c("wave_id", "grid_id")))
+  if (n_dup > 0) {
+    warning(sprintf("[%s] %d duplicate (wave_id, grid_id) rows in grid_visits; deduplicating (keeping first).",
+                    state, n_dup))
+    dt <- unique(dt, by = c("wave_id", "grid_id"))
+  }
+  dt
+}), states)
+```
+
+## Maps (per wave)
+
+```{r maps, fig.height=10, out.width="100%"}
+for (state in states) {
+  cbg_utm <- spatial_data[[state]]$cbg_utm
+  grid_sf <- spatial_data[[state]]$grid_sf
+  .this_state <- state
+  st_waves <- WAVE_RUNS[which(WAVE_RUNS$state == .this_state), ]
+  wave_ids <- unique(st_waves$wave_id)  # guard against duplicate WAVE_RUNS rows
+  all_dt <- visits_by_state[[state]]
+  make_mob_map <- function(plot_sf, fill_col, scale_fn, title_str) {
+    ggplot() + cbg_base_layer(cbg_utm, state = state) +
+      geom_sf(data = plot_sf, aes(fill = .data[[fill_col]]), color = NA) +
+      scale_fn + map_extras() + labs(title = title_str) + theme_map()
+  }
+
+  for (wid in wave_ids) {
+  gf <- merge(grid_sf[, c("grid_id", "fips_5")], all_dt[wave_id == wid], by = "grid_id", all.x = TRUE)
+  gf$weekend_ratio <- gf$visits_weekend / pmax(gf$visits_weekday + gf$visits_weekend, 1)
+  active <- gf[!is.na(gf$visits_total) & gf$visits_total > 0, ]
+
+  if (state == "UT") {
+    gf$log_visits   <- log1p(gf$visits_total)
+    gf$log_activity <- log1p(gf$activity_total)
+    gf$log_pois     <- log1p(gf$n_pois)
+    cf1 <- ut_county_agg_sf(gf, "log_visits",   fun = mean)
+    cf2 <- ut_county_agg_sf(gf, "log_activity",  fun = mean)
+    cf3 <- ut_county_agg_sf(gf, "log_pois",      fun = mean)
+    active$avg_dwell_   <- active$avg_dwell
+    active$ios_frac_    <- active$ios_frac
+    active$wknd_ratio_  <- active$weekend_ratio
+    cf4 <- ut_county_agg_sf(active, "avg_dwell_",   fun = mean)
+    cf5 <- ut_county_agg_sf(active, "ios_frac_",    fun = mean)
+    cf6 <- ut_county_agg_sf(active, "wknd_ratio_",  fun = mean)
+
+    p1 <- make_mob_map(cf1, "log_visits",   scale_fill_viridis_c(option="plasma", name="log(visits)"),   paste(wid, "- Visits (county mean)"))
+    p2 <- make_mob_map(cf2, "log_activity", scale_fill_viridis_c(option="magma",  name="log(activity)"), paste(wid, "- Activity (county mean)"))
+    p3 <- make_mob_map(cf3, "log_pois",     scale_fill_viridis_c(name="log(POIs)"),                      paste(wid, "- POI Density (county mean)"))
+    p4 <- make_mob_map(cf4, "avg_dwell_",   scale_fill_viridis_c(option="inferno", name="Dwell (hrs)"),  paste(wid, "- Dwell Time (county mean)"))
+    p5 <- make_mob_map(cf5, "ios_frac_",    scale_fill_gradient2(low="#d73027", mid="white", high="#4575b4", midpoint=0.5, name="iOS Frac"), paste(wid, "- SES Proxy"))
+    p6 <- make_mob_map(cf6, "wknd_ratio_",  scale_fill_gradient2(low="#2166ac", mid="#f7f7f7", high="#b2182b", midpoint=2/7, name="Wknd Ratio"), paste(wid, "- Weekend Ratio"))
+  } else {
+    gf$log_visits   <- log1p(gf$visits_total)
+    gf$log_activity <- log1p(gf$activity_total)
+    gf$log_pois     <- log1p(gf$n_pois)
+    p1 <- make_mob_map(gf,     "log_visits",    scale_fill_viridis_c(option="plasma",  name="log(visits)"),   paste(wid, "- Visits"))
+    p2 <- make_mob_map(gf,     "log_activity",  scale_fill_viridis_c(option="magma",   name="log(activity)"), paste(wid, "- Activity"))
+    p3 <- make_mob_map(gf,     "log_pois",      scale_fill_viridis_c(name="log(POIs)"),                       paste(wid, "- POI Density"))
+    p4 <- make_mob_map(active, "avg_dwell",     scale_fill_viridis_c(option="inferno", name="Dwell (hrs)"),   paste(wid, "- Dwell Time"))
+    p5 <- make_mob_map(active, "ios_frac",      scale_fill_gradient2(low="#d73027", mid="white", high="#4575b4", midpoint=0.5, name="iOS Frac"), paste(wid, "- SES Proxy (iOS)"))
+    p6 <- make_mob_map(active, "weekend_ratio", scale_fill_gradient2(low="#2166ac", mid="#f7f7f7", high="#b2182b", midpoint=2/7, name="Wknd Ratio"), paste(wid, "- Weekend Ratio"))
+  }
+  print((p1 + p2) / (p3 + p4) / (p5 + p6))
+  }
+}
+```
+
+## Wave-on-Wave Change
+
+Distribution of grid-level log2 visit ratios relative to the first wave (baseline).
+Median (line) with IQR ribbon across grid cells, per wave. Above 0 = growth, below 0 = decline.
+Useful for assessing whether the OD landscape stayed stable enough to pool kernel parameters across waves.
+
+```{r change_trend, fig.width=10, fig.height=4}
+trend_all <- rbindlist(lapply(states, function(state) {
+  all_dt <- visits_by_state[[state]]
+  waves  <- unique(all_dt$wave_id)
+  if (length(waves) < 2) return(NULL)
+  base_wid <- waves[1]
+  base <- unique(all_dt[wave_id == base_wid, .(grid_id, v0 = visits_total)],
+                 by = "grid_id")
+  comp <- merge(all_dt, base, by = "grid_id")
+  comp[, log2_ratio := log2((visits_total + 1) / (v0 + 1))]
+  comp[, .(state = state,
+           q25 = quantile(log2_ratio, 0.25, na.rm = TRUE),
+           med = quantile(log2_ratio, 0.50, na.rm = TRUE),
+           q75 = quantile(log2_ratio, 0.75, na.rm = TRUE)),
+       by = wave_id]
+}), fill = TRUE)
+
+if (nrow(trend_all) > 0) {
+  print(ggplot(trend_all, aes(x = wave_id, y = med, group = state, color = state)) +
+    geom_ribbon(aes(ymin = q25, ymax = q75, fill = state),
+                alpha = 0.15, color = NA) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+    geom_line(linewidth = 0.7) + geom_point(size = 2) +
+    labs(title = "Wave-on-wave mobility change (log2 ratio vs. baseline)",
+         subtitle = "Line = grid-cell median; ribbon = IQR",
+         x = "Wave", y = "log2((visits + 1) / (baseline + 1))") +
+    theme_bw() + theme(legend.position = "bottom"))
+}
+```
+
+## Distributions
+
+```{r distributions, fig.width=14, fig.height=6}
+for (state in states) {
+  all_dt <- visits_by_state[[state]]
+  dt <- all_dt[visits_total > 0]
+
+  p1 <- ggplot(dt, aes(x = log1p(visits_total), fill = wave_id)) +
+    geom_histogram(bins = 50, alpha = 0.6, position = "identity") +
+    labs(title = paste(state, "— Log Visits by Wave"), x = "log(1 + visits)") + theme_bw()
+
+  p2 <- ggplot(dt, aes(x = log1p(visits_total), y = log1p(activity_total))) +
+    geom_point(alpha = 0.05, size = 0.3) + geom_smooth(method = "lm", color = "red") +
+    facet_wrap(~wave_id) + labs(title = paste(state, "— Visits vs Activity")) + theme_bw()
+
+  print(p1 + p2)
+}
+```
+
+## OD Distance Distribution (visitor-weighted)
+
+Per-pair home→POI distance, weighted by visitor count, faceted by wave. Red dashed line = visitor-weighted median.
+Shifts across waves justify per-wave kernel σ, α refits in 06.
+
+```{r od_distance, fig.width=14, fig.height=5}
+for (state in states) {
+  cbg_utm <- spatial_data[[state]]$cbg_utm
+  cbg_centroid <- suppressWarnings(sf::st_centroid(cbg_utm))
+  cbg_xy <- sf::st_coordinates(cbg_centroid)
+  cbg_lookup <- data.table(
+    home_cbg = if (state == "UT") cbg_centroid$GEOID10 else cbg_centroid$GEOID,
+    home_x = cbg_xy[, 1], home_y = cbg_xy[, 2])
+
+  .this_state <- state
+
+  st_waves <- WAVE_RUNS[which(WAVE_RUNS$state == .this_state), ]
+  od_all <- rbindlist(lapply(st_waves$wave_id, function(wid) {
+    f <- file.path(get_wave_dir(state, wid), "intermediate", "od_home_cbg.feather")
+    if (!file.exists(f)) return(NULL)
+    dt <- as.data.table(read_feather(f)); dt[, wave_id := wid]
+  }), fill = TRUE)
+  if (nrow(od_all) == 0) next
+
+  poi_unique <- unique(od_all[, .(poi_lon, poi_lat)])
+  poi_proj <- sf::st_transform(
+    sf::st_as_sf(poi_unique, coords = c("poi_lon","poi_lat"), crs = 4326),
+    get_utm_crs(state))
+  poi_xy <- sf::st_coordinates(poi_proj)
+  poi_unique[, `:=`(poi_x = poi_xy[, 1], poi_y = poi_xy[, 2])]
+
+  od_all <- merge(od_all, poi_unique, by = c("poi_lon","poi_lat"), all.x = TRUE)
+  if (state == "UT") od_all[, home_key := substr(home_cbg, 1, 5)] else od_all[, home_key := home_cbg]
+  setnames(cbg_lookup, "home_cbg", "home_key")
+  od_all <- merge(od_all, cbg_lookup, by = "home_key", all.x = TRUE)
+  od_all[, dist_km := sqrt((poi_x - home_x)^2 + (poi_y - home_y)^2) / 1000]
+  od_all <- od_all[!is.na(dist_km) & dist_km > 0 & dist_km < 200]
+
+  # Visitor-weighted median per wave (cumsum-based, no extra deps)
+  med_by_wave <- od_all[order(dist_km),
+    .(med = dist_km[which.min(abs(cumsum(visitors) / sum(visitors) - 0.5))]),
+    by = wave_id]
+
+  print(ggplot(od_all, aes(x = dist_km, weight = visitors)) +
+    geom_histogram(bins = 50, fill = "steelblue", alpha = 0.75) +
+    geom_vline(data = med_by_wave, aes(xintercept = med),
+               color = "red", linetype = "dashed", inherit.aes = FALSE) +
+    geom_text(data = med_by_wave,
+              aes(x = med, y = Inf, label = sprintf("med=%.1f km", med)),
+              vjust = 1.5, hjust = -0.05, color = "red", size = 3,
+              inherit.aes = FALSE) +
+    facet_wrap(~ wave_id, scales = "free_y") +
+    scale_x_log10() +
+    labs(title = paste(state, "— OD Distance (visitor-weighted)"),
+         x = "Distance home → POI (km, log10)", y = "Visitor count") +
+    theme_bw())
+}
+```
+
+## OD Flow Map (flowmapblue)
+
+Home → POI flows rendered with [flowmap.blue](https://flowmap.blue) via the
+`flowmapblue` R wrapper. Aggregated **region × region** (CBG×CBG for NY,
+county×county for UT) — i.e. a true OD matrix, not point-to-point — following
+the LOOKUP/04 pattern. One widget per (state, wave); top-1500 strongest flows.
+Skipped if `flowmapblue` not installed.
+
+```{r od_flowmap, eval=requireNamespace("flowmapblue", quietly=TRUE)}
+# NOTE: hard-coded for local runs; strip before pushing to remote.
+MAPBOX_TOKEN <- "pk.eyJ1IjoicHJpbmNlb2IiLCJhIjoiY21tcmp6N210MHNnZTJvc2llN3l1ZWRobSJ9.aE_ZlsJYZVPHPmCaQtM3VA"
+
+for (state in states) {
+  # Build a single region->lon/lat lookup from the spatial layer.
+  # NY: CBG (12-digit GEOID); UT: county (5-digit FIPS_STR / GEOID10).
+  reg_sf <- spatial_data[[state]]$cbg_utm
+  reg_id_col <- if (state == "UT") "GEOID10" else "GEOID"
+  reg_ll <- suppressWarnings(sf::st_centroid(sf::st_transform(reg_sf, 4326)))
+  reg_xy <- sf::st_coordinates(reg_ll)
+  reg_lookup <- data.table(
+    reg_id = as.character(reg_ll[[reg_id_col]]),
+    lon    = reg_xy[, 1],
+    lat    = reg_xy[, 2])
+  reg_lookup <- reg_lookup[!is.na(reg_id)]
+  reg_lookup <- unique(reg_lookup, by = "reg_id")
+
+  # Region key: CBG keeps full 12-digit; county is 5-digit (truncate 12-digit
+  # CBG inputs from od_home_cbg.feather to first 5 chars to align with county
+  # FIPS in reg_lookup).
+  to_key <- if (state == "UT") function(x) substr(x, 1, 5) else identity
+
+  .this_state <- state
+
+  st_waves <- WAVE_RUNS[which(WAVE_RUNS$state == .this_state), ]
+  for (wid in st_waves$wave_id) {
+    f <- file.path(get_wave_dir(state, wid), "intermediate", "od_home_cbg.feather")
+    if (!file.exists(f)) next
+    od <- as.data.table(read_feather(f))
+    if (!nrow(od)) next
+
+    # Aggregate visitors at region x region (origin home -> dest CBG/county)
+    od[, `:=`(origin = to_key(home_cbg), dest = to_key(poi_cbg))]
+    flows <- od[!is.na(origin) & !is.na(dest) & origin != "" & dest != "" &
+                  visitors > 0,
+                .(count = sum(visitors, na.rm = TRUE)),
+                by = .(origin, dest)]
+    if (!nrow(flows)) next
+
+    # Top-1500 strongest pairs (keeps widget responsive for NY's ~6k CBGs)
+    setorder(flows, -count)
+    flows <- head(flows, 1500)
+
+    # Build locations: only ids actually used in flows
+    used_ids <- unique(c(flows$origin, flows$dest))
+    locs <- reg_lookup[reg_id %in% used_ids,
+                       .(id = reg_id, name = reg_id, lon, lat)]
+    if (!nrow(locs)) next
+    # Drop flows whose endpoints are missing centroids
+    flows <- flows[origin %in% locs$id & dest %in% locs$id]
+    if (!nrow(flows)) next
+
+    # Persist OD pairs + locations alongside the widget for downstream reuse.
+    out_dir <- file.path(get_wave_dir(state, wid), "intermediate")
+    fwrite(flows, file.path(out_dir, "od_flow_pairs.csv"))
+    fwrite(locs,  file.path(out_dir, "od_flow_locations.csv"))
+
+    cat(sprintf("\n\n### %s \u2014 %s (%s flows, %s nodes)\n\n",
+                state, mlabels[wid], fmt(nrow(flows)), fmt(nrow(locs))))
+    print(htmltools::tagList(flowmapblue::flowmapblue(
+      locations         = as.data.frame(locs),
+      flows             = as.data.frame(flows),
+      mapboxAccessToken = MAPBOX_TOKEN,
+      darkMode          = TRUE,
+      clustering        = TRUE)))
+  }
+}
+```
+
+## Brand Co-visitation Network
+
+Top brand→brand co-visitation edges (same-day scope) per wave, with Louvain communities.
+Honest framing: these are unordered co-visit counts (top-20 brands per POI), **not** ordered trip chains.
+Communities reveal *trip-purpose bundles* — e.g., essentials (grocery + pharmacy) vs. discretionary (dining + retail).
+
+```{r covisit_network, fig.width=12, fig.height=8}
+library(igraph)
+top_n_edges <- 80
+brand_communities <- list()  # E10: collect Louvain memberships per (state, wave)
+for (state in states) {
+  .this_state <- state
+  st_waves <- WAVE_RUNS[which(WAVE_RUNS$state == .this_state), ]
+  pick_waves <- unique(st_waves$wave_id)
+  for (wid in pick_waves) {
+    f <- file.path(get_wave_dir(state, wid), "intermediate", "trip_chains.feather")
+    if (!file.exists(f)) next
+    edges <- as.data.table(read_feather(f))
+    edges <- edges[scope == "day" &
+                   !is.na(source_brand) & !is.na(target_brand) &
+                   source_brand != "" & target_brand != "" &
+                   source_brand != target_brand]
+    if (nrow(edges) == 0) next
+
+    # undirected: collapse symmetric pairs
+    edges[, c("a","b") := .(pmin(source_brand, target_brand),
+                            pmax(source_brand, target_brand))]
+    edges <- edges[, .(weight = sum(covisit_count)), by = .(a, b)]
+    setorder(edges, -weight)
+    edges <- head(edges, top_n_edges)
+
+    g <- graph_from_data_frame(edges[, .(a, b, weight)], directed = FALSE)
+    cl <- cluster_louvain(g, weights = E(g)$weight)
+    V(g)$community <- membership(cl)
+    V(g)$degree    <- strength(g, weights = E(g)$weight)
+
+    # E10: persist Louvain membership for cross-wave ARI/NMI.
+    brand_communities[[paste(state, wid, sep = "_")]] <- data.table(
+      state = state, wave_id = wid,
+      brand = V(g)$name, community = as.integer(V(g)$community))
+
+    pal <- viridis::viridis(max(V(g)$community))
+    par(mar = c(0,0,2,0))
+    set.seed(1)
+    plot(g,
+         layout         = layout_with_fr(g, weights = E(g)$weight),
+         vertex.color   = pal[V(g)$community],
+         vertex.size    = 4 + 8 * sqrt(V(g)$degree / max(V(g)$degree)),
+         vertex.label.cex = 0.7,
+         vertex.label.color = "black",
+         vertex.frame.color = NA,
+         edge.width     = 0.3 + 3 * (E(g)$weight / max(E(g)$weight)),
+         edge.color     = adjustcolor("grey50", alpha = 0.4),
+         main = sprintf("%s %s — Brand co-visitation (top %d edges, %d communities)",
+                        state, wid, top_n_edges, length(unique(V(g)$community))))
+  }
+}
+
+# E10: Cross-wave ARI/NMI of Louvain memberships on the brand intersection.
+if (length(brand_communities) >= 2) {
+  bc_all <- rbindlist(brand_communities, fill = TRUE)
+  fwrite(bc_all, file.path("outputs", "spatiotemporal_risk",
+                            "brand_louvain_memberships.csv"))
+  ari_rows <- list()
+  for (st in unique(bc_all$state)) {
+    bc_st <- bc_all[state == st]
+    waves_st <- sort(unique(bc_st$wave_id))
+    if (length(waves_st) < 2) next
+    for (i in seq_len(length(waves_st) - 1L)) {
+      w1 <- waves_st[i]; w2 <- waves_st[i + 1L]
+      m1 <- bc_st[wave_id == w1]
+      m2 <- bc_st[wave_id == w2]
+      common <- intersect(m1$brand, m2$brand)
+      if (length(common) < 5) next
+      c1 <- m1[match(common, brand), community]
+      c2 <- m2[match(common, brand), community]
+      ari <- igraph::compare(c1, c2, method = "adjusted.rand")
+      nmi <- igraph::compare(c1, c2, method = "nmi")
+      ari_rows[[length(ari_rows) + 1]] <- data.table(
+        state = st, wave_a = w1, wave_b = w2,
+        n_brands_common = length(common),
+        ARI = ari, NMI = nmi)
+    }
+  }
+  if (length(ari_rows) > 0) {
+    ari_dt <- rbindlist(ari_rows, fill = TRUE)
+    fwrite(ari_dt, file.path("outputs", "spatiotemporal_risk",
+                              "brand_louvain_ari.csv"))
+    print(knitr::kable(ari_dt, format = "pipe", digits = 3,
+                caption = "Cross-wave Louvain stability (ARI / NMI on brand intersection)"))
+  }
+}
+```
+
+## Daily Visits Time Series
+
+Single black line per wave window; weekends shaded pink (Sat 00:00 → Mon 00:00).
+Style follows the rect-shaded approach from *Visualizing Time Series Data with
+ggplot2* — minimalistic, lets the weekday/weekend rhythm read at a glance
+without color/shape clutter.
+
+```{r daily_timeseries, fig.width=10, fig.height=3.5}
+for (state in states) {
+  .this_state <- state
+  st_waves <- WAVE_RUNS[which(WAVE_RUNS$state == .this_state), ]
+  for (wid in st_waves$wave_id) {
+    f <- file.path(get_wave_dir(state, wid), "intermediate", "daily_stats.csv")
+    if (!file.exists(f)) next
+    ds <- fread(f); ds[, date := as.Date(date)]
+    if (!nrow(ds)) next
+    wknd <- ds[wday(date) == 7, .(xmin = date, xmax = date + 2)]
+
+    print(ggplot(ds, aes(x = date, y = total_visits)) +
+      geom_rect(data = wknd, inherit.aes = FALSE,
+                aes(xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf),
+                fill = "grey85", alpha = 0.45) +
+      geom_line(linewidth = 0.5, color = "grey20") +
+      scale_y_continuous(labels = scales::comma) +
+      scale_x_date(date_labels = "%b %d", date_breaks = "2 weeks", expand = c(0, 0)) +
+      labs(title = paste(state, "—", mlabels[wid]),
+           subtitle = "Daily visit volume (weekends shaded)",
+           x = NULL, y = "Total Visits") +
+      theme_minimal(base_size = 11) +
+      theme(plot.title = element_text(face = "bold"),
+            panel.grid.minor = element_blank(),
+            axis.text.x = element_text(angle = 30, hjust = 1)))
+  }
+}
+```
+
+## Diurnal Visit Profile (day-of-week × hour)
+
+Visit-weighted heatmap of visits per (day-of-week, hour-of-day), one panel per
+wave. Sourced from `intermediate/diurnal_profile.csv` (summed `VISITS_BY_EACH_HOUR`
+across all weekly POI rows). Highlights how nightlife/curfew, work-from-home,
+and weekend patterns shifted across pandemic phases. Skipped silently if
+03 has not been re-run with the new summary writer.
+
+```{r diurnal_heatmap, fig.width=10, fig.height=3.5}
+dow_lab <- c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+for (state in states) {
+  .this_state <- state
+  st_waves <- WAVE_RUNS[which(WAVE_RUNS$state == .this_state), ]
+  for (wid in st_waves$wave_id) {
+    f <- file.path(get_wave_dir(state, wid), "intermediate",
+                   "diurnal_profile.csv")
+    if (!file.exists(f)) next
+    dp <- fread(f); if (!nrow(dp) || sum(dp$visits) == 0) next
+    dp[, dow_f := factor(dow_lab[dow + 1L], levels = dow_lab)]
+    dp[, share := visits / sum(visits)]
+    print(ggplot(dp, aes(x = hour, y = dow_f, fill = share)) +
+      geom_tile() +
+      scale_fill_viridis_c(option = "magma", labels = scales::percent_format(0.1)) +
+      scale_x_continuous(breaks = seq(0, 23, 3), expand = c(0, 0)) +
+      scale_y_discrete(limits = rev(dow_lab)) +
+      labs(title = paste(state, "\u2014", mlabels[wid]),
+           subtitle = "Share of weekly visits by day-of-week and hour",
+           x = "Hour of day", y = NULL, fill = "Share") +
+      theme_minimal(base_size = 11) +
+      theme(plot.title = element_text(face = "bold"),
+            panel.grid = element_blank()))
+  }
+}
+```
+
+## Dwell-Time Bucket Distribution
+
+Wave-level breakdown of visit dwell-time buckets (`<5`, `5–20`, `21–60`,
+`61–240`, `>240` minutes) summed across all POIs. Stacked-share bars compare
+how exposure dose shifted across pandemic phases per state. Sourced from
+`intermediate/dwell_buckets.csv` (re-run 03 to populate).
+
+```{r dwell_buckets, fig.width=10, fig.height=4}
+bucket_levels <- c("<5", "5-20", "21-60", "61-240", ">240")
+# ADVAN keys: "<5", "5-20", "21-60", "61-240", ">240"
+norm_bucket <- function(x) {
+  x <- gsub("^<\\s*", "<", x)
+  x <- gsub("^>\\s*", ">", x)
+  x <- gsub("\\s", "", x)
+  x
+}
+for (state in states) {
+  .this_state <- state
+  st_waves <- WAVE_RUNS[which(WAVE_RUNS$state == .this_state), ]
+  rows <- rbindlist(lapply(st_waves$wave_id, function(wid) {
+    f <- file.path(get_wave_dir(state, wid), "intermediate",
+                   "dwell_buckets.csv")
+    if (!file.exists(f)) return(NULL)
+    d <- fread(f); if (!nrow(d)) return(NULL)
+    d[, wave_id := wid]
+  }), fill = TRUE)
+  if (!nrow(rows)) next
+  rows[, bucket := norm_bucket(bucket)]
+  rows <- rows[bucket %in% bucket_levels]
+  rows[, bucket := factor(bucket, levels = bucket_levels)]
+  rows[, share  := count / sum(count), by = wave_id]
+  # Build wave_label factor with unique, ordered levels (defensive against
+  # duplicate labels or repeated wave_ids in st_waves).
+  wave_order  <- unique(as.character(st_waves$wave_id))
+  level_lbls  <- unique(unname(mlabels[wave_order]))
+  rows[, wave_label := factor(unname(mlabels[wave_id]), levels = level_lbls)]
+  print(ggplot(rows, aes(x = wave_label, y = share, fill = bucket)) +
+    geom_col(width = 0.7) +
+    scale_y_continuous(labels = scales::percent_format(1), expand = c(0, 0)) +
+    scale_fill_brewer(palette = "YlOrRd", direction = 1) +
+    labs(title = paste(state, "\u2014 Dwell-time bucket shares per wave"),
+         subtitle = "Share of visits by dwell-time bucket (minutes)",
+         x = NULL, y = "Share of visits", fill = "Dwell (min)") +
+    theme_minimal(base_size = 11) +
+    theme(plot.title = element_text(face = "bold"),
+          panel.grid.major.x = element_blank(),
+          legend.position = "right"))
+}
+```
+
+## Wave Summary
+
+```{r summary_table}
+for (state in states) {
+  all_dt <- visits_by_state[[state]]
+  print(all_dt[, .(
+    active_cells = sum(visits_total > 0), total_visits = sum(visits_total),
+    total_pois = sum(n_pois),
+    med_dwell = round(median(avg_dwell[avg_dwell > 0], na.rm = TRUE), 2),
+    med_ios   = round(median(ios_frac[ios_frac > 0], na.rm = TRUE), 3),
+    pct_wknd  = round(100 * sum(visits_weekend) / pmax(sum(visits_total), 1), 1)
+  ), by = wave_id])
+}
+```
+
+## Mobility–Case Coupling (EDA)
+
+Pre-fit exploratory diagnostics linking observed mobility to observed case
+incidence. Style borrowed from Niraula's London EDA (spaghetti + bold mean
+overlay, wave-boundary annotations); aggregations adapted to NY (MODZCTA) and
+UT (county) supports.
+
+```{r coupling_load}
+# Per-state daily (geo_id x date) caserate, plus daily state-mean visits
+# from daily_stats.csv. Builds: case_long[state], visits_long[state].
+case_long <- list(); visits_long <- list()
+
+for (state in states) {
+  .this_state <- state
+  st_waves <- WAVE_RUNS[which(WAVE_RUNS$state == .this_state), ]
+  cl <- rbindlist(lapply(seq_len(nrow(st_waves)), function(i) {
+    wid <- st_waves$wave_id[i]
+    f <- file.path(get_wave_dir(state, wid), "tables", "case_rates.csv")
+    if (!file.exists(f)) return(NULL)
+    d <- fread(f)
+    d[, `:=`(geo_id = as.character(geo_id), date = as.Date(date), wave_id = wid)]
+    d
+  }), fill = TRUE)
+  if (nrow(cl)) cl <- cl[!is.na(case_rate)]
+  case_long[[state]] <- cl
+
+  vl <- rbindlist(lapply(st_waves$wave_id, function(wid) {
+    f <- file.path(get_wave_dir(state, wid), "intermediate", "daily_stats.csv")
+    if (!file.exists(f)) return(NULL)
+    d <- fread(f)
+    d[, `:=`(date = as.Date(date), wave_id = wid)]
+    d
+  }), fill = TRUE)
+  visits_long[[state]] <- vl
+}
+```
+
+```{r coupling_caserate_spaghetti, fig.width=10, fig.height=3.5}
+# One plot per (state, wave): per-geo_id caserate spaghetti + state-mean overlay.
+for (state in states) {
+  cl <- case_long[[state]]
+  if (!nrow(cl)) next
+  for (wid in unique(cl$wave_id)) {
+    clw <- cl[wave_id == wid]
+    if (!nrow(clw)) next
+    state_mean <- clw[, .(mean_cr = mean(case_rate, na.rm = TRUE)), by = date]
+    p <- ggplot(clw, aes(x = date, y = case_rate, group = geo_id)) +
+      geom_line(linewidth = 0.15, alpha = 0.35, color = "#1f78b4") +
+      geom_line(data = state_mean, aes(x = date, y = mean_cr, group = 1),
+                color = "black", linewidth = 0.9, linetype = "dashed",
+                inherit.aes = FALSE) +
+      scale_x_date(date_breaks = "2 weeks", date_labels = "%b %d") +
+      labs(title = paste(state, "—", mlabels[wid]),
+           subtitle = "Daily case rate per geo (spaghetti) with state mean overlay",
+           x = NULL, y = "Cases / 100k") +
+      theme_minimal(base_size = 11) +
+      theme(plot.title = element_text(face = "bold"),
+            panel.grid.minor = element_blank(),
+            axis.text.x = element_text(angle = 30, hjust = 1))
+    print(p)
+  }
+}
+```
+
+```{r coupling_visits_vs_cases, fig.width=10, fig.height=3.5}
+# One plot per (state, wave): state-mean visits vs caserate, z-scored within
+# the wave window; 14-day rolling Pearson correlation overlaid on a secondary
+# y-axis.
+zs <- function(x) (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE)
+roll_cor <- function(x, y, w = 14) {
+  n <- length(x); out <- rep(NA_real_, n)
+  for (i in seq.int(w, n)) {
+    xi <- x[(i - w + 1):i]; yi <- y[(i - w + 1):i]
+    if (sum(!is.na(xi) & !is.na(yi)) >= w / 2)
+      out[i] <- suppressWarnings(cor(xi, yi, use = "pairwise.complete.obs"))
+  }
+  out
+}
+for (state in states) {
+  cl <- case_long[[state]]; vl <- visits_long[[state]]
+  if (!nrow(cl) || !nrow(vl)) next
+  for (wid in unique(cl$wave_id)) {
+    daily <- merge(
+      cl[wave_id == wid, .(mean_cr = mean(case_rate, na.rm = TRUE)), by = date],
+      vl[wave_id == wid, .(total_visits = sum(total_visits, na.rm = TRUE)), by = date],
+      by = "date", all = TRUE)
+    if (!nrow(daily)) next
+    setorder(daily, date)
+    daily[, `:=`(z_cr = zs(mean_cr), z_v = zs(total_visits))]
+    daily[, rcor := roll_cor(mean_cr, total_visits, w = 14)]
+
+    long <- melt(daily[, .(date, `Cases (z)` = z_cr, `Visits (z)` = z_v)],
+                 id.vars = "date", variable.name = "series", value.name = "value")
+    p <- ggplot(long, aes(x = date, y = value, color = series)) +
+      geom_line(linewidth = 0.6, alpha = 0.9) +
+      geom_line(data = daily, aes(x = date, y = rcor * 2),
+                color = "grey30", linewidth = 0.4, linetype = "dotted",
+                inherit.aes = FALSE) +
+      geom_hline(yintercept = 0, color = "grey70", linewidth = 0.3) +
+      scale_color_manual(values = c("Cases (z)" = "#b2182b", "Visits (z)" = "#1f78b4")) +
+      scale_y_continuous(name = "Standardized value",
+                         sec.axis = sec_axis(~ . / 2, name = "14-day rolling cor")) +
+      scale_x_date(date_breaks = "2 weeks", date_labels = "%b %d") +
+      labs(title = paste(state, "—", mlabels[wid]),
+           subtitle = "State-mean cases vs visits (z-scored) and rolling correlation",
+           x = NULL, color = NULL) +
+      theme_minimal(base_size = 11) +
+      theme(plot.title = element_text(face = "bold"),
+            legend.position = "top",
+            panel.grid.minor = element_blank(),
+            axis.text.x = element_text(angle = 30, hjust = 1),
+            axis.title.y.right = element_text(color = "grey30"))
+    print(p)
+  }
+}
+```
+
+```{r coupling_cumulative_choropleth, fig.width=14, fig.height=5.5}
+# Per-wave cumulative case rate, faceted choropleth. Uses MODZCTA (NY) or
+# county (UT) shapefiles already referenced by load_spatial / CONFIG.
+modzcta_sf <- st_read(file.path("data", "MODZCTA",
+  "geo_export_5392c927-ee1e-4b9c-9787-2cad9456c83b.shp"), quiet = TRUE)
+
+for (state in states) {
+  cl <- case_long[[state]]
+  if (!nrow(cl)) next
+  # Sum of daily per-100k rates across the wave window (proxy for cumulative
+  # incidence; exact only if all geos share the same n_days, which is the case
+  # within a wave by construction).
+  wave_cum <- cl[, .(cum_cr = sum(case_rate, na.rm = TRUE)),
+                 by = .(geo_id, wave_id)]
+  wave_cum[, wave_label := mlabels[wave_id]]
+  if (state == "NY") {
+    sf_obj <- modzcta_sf
+    sf_obj$geo_id <- as.character(sf_obj$modzcta)
+  } else if (state == "UT") {
+    sf_obj <- spatial_data[[state]]$cbg_utm
+    sf_obj$geo_id <- as.character(sf_obj$FIPS_STR)
+  } else {
+    next
+  }
+  joined <- merge(sf_obj, wave_cum, by = "geo_id", all.x = TRUE)
+  p <- ggplot(joined) +
+    geom_sf(aes(fill = cum_cr), color = NA) +
+    facet_wrap(~ wave_label, nrow = 1) +
+    scale_fill_viridis_c(option = "H", trans = "sqrt", na.value = "grey90",
+                         labels = scales::label_number(accuracy = 1)) +
+    labs(title = paste(state, "— Sum of daily case rates by wave (per 100k)"),
+         fill = NULL) +
+    theme_map() +
+    theme(legend.position = "bottom",
+          legend.key.width = grid::unit(2, "cm"),
+          legend.key.height = grid::unit(3, "mm"))
+  print(p)
+}
+```
+
+```{r coupling_geo_bivariate, fig.width=14, fig.height=4.5}
+# Cross-sectional: total visits vs mean caserate at the geo unit, faceted by
+# wave. Builds grid -> geo_id once per state from the grid gpkg.
+for (state in states) {
+  vbs  <- visits_by_state[[state]]
+  cl   <- case_long[[state]]
+  if (!nrow(vbs) || !nrow(cl)) next
+
+  grid_path <- file.path(CONFIG$grids_dir, sprintf("grid_100m_%s.gpkg", state))
+  grid_geo  <- as.data.table(st_drop_geometry(st_read(grid_path, quiet = TRUE)))
+  if (state == "NY") {
+    xwalk <- fread(CONFIG$nyc_crosswalk_path)
+    xwalk[, `:=`(cbg_geoid = as.character(cbg_geoid),
+                 modzcta   = as.character(modzcta))]
+    xwalk <- xwalk[!duplicated(cbg_geoid)]
+    grid_geo[, cbg_geoid := as.character(cbg_geoid)]
+    grid_geo <- merge(grid_geo, xwalk[, .(cbg_geoid, modzcta)],
+                      by = "cbg_geoid", all.x = TRUE)
+    grid_geo[, geo_id := modzcta]
+  } else {
+    grid_geo[, geo_id := as.character(fips_5)]
+  }
+  grid_geo <- grid_geo[!is.na(geo_id) & geo_id != "unknown" & geo_id != "36NA"]
+
+  vbs2 <- merge(vbs, grid_geo[, .(grid_id, geo_id)], by = "grid_id", all.x = TRUE)
+  vbs_geo <- vbs2[!is.na(geo_id),
+                  .(geo_visits = sum(visits_total, na.rm = TRUE)),
+                  by = .(wave_id, geo_id)]
+  cr_geo <- cl[, .(geo_caserate = mean(case_rate, na.rm = TRUE)),
+               by = .(wave_id, geo_id)]
+  bv <- merge(vbs_geo, cr_geo, by = c("wave_id", "geo_id"))
+  bv <- bv[geo_visits > 0 & geo_caserate > 0]
+  bv[, wave_label := mlabels[wave_id]]
+
+  ann <- bv[, .(
+    r   = cor(log10(geo_visits), geo_caserate, use = "complete.obs"),
+    n   = .N
+  ), by = wave_label]
+  ann[, lab := sprintf("r = %.2f  (n = %d)", r, n)]
+
+  p <- ggplot(bv, aes(x = geo_visits, y = geo_caserate)) +
+    geom_point(alpha = 0.5, size = 1.2, color = "#1f78b4") +
+    geom_smooth(method = "lm", se = FALSE, color = "#b2182b", linewidth = 0.6) +
+    geom_text(data = ann, aes(label = lab),
+              x = -Inf, y = Inf, hjust = -0.1, vjust = 1.5,
+              size = 3.4, color = "grey20", inherit.aes = FALSE) +
+    facet_wrap(~ wave_label, nrow = 1) +
+    scale_x_log10(labels = scales::label_number(scale_cut = scales::cut_short_scale())) +
+    labs(title = paste(state, "— Total visits vs mean caserate at geo level (per wave)"),
+         x = "Total wave visits (geo unit, log10)",
+         y = "Mean wave caserate (per 100k)") +
+    theme_bw() +
+    theme(plot.title = element_text(face = "bold"),
+          strip.background = element_rect(fill = "grey90"))
+  print(p)
+}
+```
+
+## Cross-Correlation Lag Scan (visits → cases)
+
+```{r coupling_ccf_lagscan, fig.width=11, fig.height=5}
+# AOAS Slater 2025 §3.2: scan lags ℓ ∈ [-3, +21] days for cor(visits_t,
+# cases_{t+ℓ}); peak lag and its CI motivate the choice of mob_lag3/5/7.
+# Per (state, wave): detrend both series with a centered 7-day rolling mean,
+# then compute Pearson cor across lags. Persists the table (CSV) so 08a can
+# read peak lags later if we want a data-driven `mob_lag_best` covariate.
+detrend <- function(x, w = 7) {
+  trend <- zoo::rollmean(x, k = w, fill = NA, align = "center")
+  x - trend
+}
+
+ccf_rows <- list()
+LAGS <- -3:28
+
+for (state in states) {
+  cl <- case_long[[state]]; vl <- visits_long[[state]]
+  if (is.null(cl) || is.null(vl) || !nrow(cl) || !nrow(vl)) next
+  for (wid in unique(cl$wave_id)) {
+    daily <- merge(
+      cl[wave_id == wid, .(mean_cr = mean(case_rate, na.rm = TRUE)), by = date],
+      vl[wave_id == wid, .(total_visits = sum(total_visits, na.rm = TRUE)), by = date],
+      by = "date", all = TRUE)
+    if (nrow(daily) < 14) next
+    setorder(daily, date)
+    daily[, c_d := detrend(mean_cr)]
+    daily[, v_d := detrend(total_visits)]
+    n <- nrow(daily)
+    for (lg in LAGS) {
+      ok <- seq.int(max(1, 1 - lg), min(n, n - lg))
+      if (length(ok) < 14) next
+      x <- daily$v_d[ok]
+      y <- daily$c_d[ok + lg]
+      r <- suppressWarnings(cor(x, y, use = "pairwise.complete.obs"))
+      ccf_rows[[length(ccf_rows) + 1]] <- data.table(
+        state = state, wave_id = wid, lag = lg, cor = r,
+        n_used = sum(!is.na(x) & !is.na(y))
+      )
+    }
+  }
+}
+
+if (length(ccf_rows)) {
+  ccf_dt <- rbindlist(ccf_rows)
+  ccf_dt[, ci95 := 1.96 / sqrt(pmax(n_used, 1))]
+  ccf_dt[, wave_label := mlabels[wave_id]]
+
+  # Peak-lag table per (state, wave).
+  peaks <- ccf_dt[, .SD[which.max(cor)], by = .(state, wave_id, wave_label)]
+  peaks[, label := sprintf("peak ℓ = %d d   r = %.2f", lag, cor)]
+  print(peaks[, .(state, wave_label, peak_lag_days = lag,
+                    peak_cor = round(cor, 3), n_used)])
+
+  ccf_csv <- file.path("outputs", "spatiotemporal_risk", "ccf_lag_scan.csv")
+  dir.create(dirname(ccf_csv), recursive = TRUE, showWarnings = FALSE)
+  fwrite(ccf_dt, ccf_csv)
+  fwrite(peaks[, .(state, wave_id, wave_label, peak_lag_days = lag,
+                     peak_cor = cor, n_used)],
+         sub("\\.csv$", "_peaks.csv", ccf_csv))
+
+  for (st in unique(ccf_dt$state)) {
+    p <- ggplot(ccf_dt[state == st],
+                aes(x = lag, y = cor, color = wave_label)) +
+      geom_ribbon(aes(ymin = -ci95, ymax = ci95, fill = wave_label),
+                  alpha = 0.10, color = NA) +
+      geom_hline(yintercept = 0, color = "grey50") +
+      geom_line(linewidth = 0.7) +
+      geom_point(data = peaks[state == st],
+                 aes(x = lag, y = cor), size = 2.5, shape = 21,
+                 fill = "white", stroke = 1) +
+      geom_text(data = peaks[state == st],
+                aes(x = lag, y = cor, label = label),
+                hjust = -0.1, vjust = -0.6, size = 3.2, show.legend = FALSE) +
+      facet_wrap(~ wave_label, nrow = 1) +
+      labs(title = paste(st, "— Cross-correlation: visits leading caserate"),
+           subtitle = "Lag ℓ > 0 = visits precede cases by ℓ days (detrended series).",
+           x = "Lag ℓ (days)", y = "Pearson cor",
+           color = NULL, fill = NULL) +
+      theme_bw() +
+      theme(plot.title = element_text(face = "bold"),
+            legend.position = "none",
+            strip.background = element_rect(fill = "grey90"))
+    print(p)
+  }
+}
+```
+

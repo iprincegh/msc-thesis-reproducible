@@ -1,0 +1,135 @@
+---
+title: "09 - Unified Component Model (clean, shareable)"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+---
+
+
+## Overview
+
+This cleaned, shareable version of the `09_fit_model` pipeline is a minimal, publication-ready template. It removes personal debugging narratives, cluster-specific anecdotes, and large in-line run logs while preserving the core pipeline structure and the points where users should provide data and configuration.
+
+Required inputs
+
+- `CONFIG` object (paths to `grids_dir`, `output_dir`, and other resources).
+- `helpers/_utils.R` and `helpers/_adjacency.R` should be available (this template assumes core helper functions such as `fit_model()`, `extract_model_outputs()`, `build_formulas()` are defined there).
+
+Minimal run options (via environment variables)
+
+- `fit_state`, `fit_wave` — restrict to a single state/wave
+- `fit_num_threads` — INLA threading string (e.g. "1:2" or "4:9")
+- `fit_force_refit` — set to `1` to force all variants to re-fit
+- `fit_force_warmstart` — set to `1` to allow warm-starting from related models
+- `fit_full_cpo`, `fit_full_quality` — toggles for evaluation/integration strategies
+- `fit_n_st_clusters` — override `N_ST_CLUSTERS` when desired
+
+Note: This file is a compact, shareable template. For the full, production pipeline with all optimizations and data-specific handling, see `pipeline/09_fit_model.Rmd`.
+
+```{r setup, include=FALSE}
+source(here::here("helpers/_utils.R"))
+source(here::here("helpers/_adjacency.R"))
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# Simple timestamped logger used in the template
+log_msg <- function(...) {
+  cat(sprintf("[%s]", format(Sys.time(), "%H:%M:%S")), " ", ..., "\n", sep = "")
+}
+```
+
+## Configuration
+
+```{r config}
+# Minimal, sensible defaults for shareable template
+N_ST_CLUSTERS <- as.integer(Sys.getenv("fit_n_st_clusters", 40))
+.fit_num_threads <- Sys.getenv("fit_num_threads", "1:2")
+.fit_full_cpo <- identical(Sys.getenv("fit_full_cpo"), "1")
+.fit_full_quality <- identical(Sys.getenv("fit_full_quality"), "1")
+# Other CONFIG entries expected to be provided externally (project-specific)
+```
+
+## Example: Cleaned Save & Comparison Snippet
+
+This chunk demonstrates a concise, shareable approach to persisting fit outputs and performing model comparison. It intentionally omits verbose run-time narrative and cluster-specific advice.
+
+```{r fit-snippet}
+# -- Within the per-model loop (simplified) --
+# Assume: 'fit' is the returned object from fit_model();
+#         'comp' is a data.table accumulating comparison rows;
+#         'ckpt_out', 'ckpt_comp', 'ckpt_conv', 'ckpt_dir_t' are defined paths.
+
+if (fit$status == "OK") {
+  # Extract and persist model outputs
+  mo <- extract_model_outputs(fit$result, df, subset$grid_index, mn, E_vec)
+  saveRDS(mo, ckpt_out)
+
+  # Save posterior hyperparameters (for optional warm-starting)
+  ws_theta <- fit$result$mode$theta
+  if (is.null(ws_theta) && !is.null(fit$result$summary.hyperpar)) {
+    ws_theta <- fit$result$summary.hyperpar$mode
+  }
+  if (!is.null(ws_theta) && length(ws_theta) > 0) {
+    saveRDS(ws_theta, file.path(ckpt_dir_t, paste0(mn, "_mode.rds")))
+    log_msg("Saved theta mode for", mn)
+  }
+
+  # Save latent posterior mean (optional warm-start vector)
+  ws_x <- fit$result$mode$x
+  if (!is.null(ws_x) && length(ws_x) > 0) {
+    saveRDS(ws_x, file.path(ckpt_dir_t, paste0(mn, "_xmode.rds")))
+    log_msg("Saved x-mode for", mn)
+  }
+
+  rm(mo)
+}
+
+# Basic memory cleanup
+rm(fit)
+gc(full = TRUE)
+```
+
+```{r comparison-snippet}
+# Reload extracted outputs for OK models (example)
+ok_models <- comp[Status == "OK", Model]
+outputs <- list()
+for (mn in ok_models) {
+  pth <- file.path(ckpt_dir_m, paste0(mn, ".rds"))
+  if (file.exists(pth)) outputs[[mn]] <- readRDS(pth)
+}
+
+# Model comparison: compute deltas defensively
+ok <- comp[Status == "OK"]
+if (nrow(ok) > 0) {
+  ok[, dWAIC := if (all(is.na(WAIC))) NA_real_ else WAIC - min(WAIC, na.rm = TRUE)]
+  ok[, dDIC := if (all(is.na(DIC))) NA_real_ else DIC - min(DIC, na.rm = TRUE)]
+  comp[Status == "OK", `:=`(dWAIC = ok$dWAIC, dDIC = ok$dDIC)]
+  print(ok[order(WAIC)])
+  if (!all(is.na(ok$WAIC))) {
+    best_model <- ok[which.min(WAIC), Model]
+  } else {
+    best_model <- NA_character_
+  }
+}
+```
+
+## Minimal save of final artifacts
+
+```{r save-final}
+# Create a compact final object for downstream steps
+final <- list(
+  state = state, wave_id = wave_id, best_model = best_model,
+  comparison = comp, n_obs = nrow(df)
+)
+saveRDS(final, file.path(out_dir, "models", "model_results_unified.rds"))
+fwrite(comp, file.path(out_dir, "tables", "model_comparison_unified.csv"))
+```
+
+## Notes for users
+
+```{r}
+# End of template
+```

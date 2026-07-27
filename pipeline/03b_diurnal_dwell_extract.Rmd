@@ -1,0 +1,137 @@
+---
+title: "03b - Diurnal & Dwell-Bucket Extractor (lightweight)"
+author: "Prince Oppong Boakye"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    code_folding: show
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+source(here::here("helpers/_utils.R"))
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Purpose
+
+Re-extract only `VISITS_BY_EACH_HOUR` and `BUCKETED_DWELL_TIMES` from the
+weekly Advan parquets and write per-wave summaries:
+
+- `intermediate/diurnal_profile.csv` — 168-row (dow x hour) visit totals
+- `intermediate/dwell_buckets.csv`   — bucket -> total count
+
+This is a side-effect-only companion to `03_advan_subset.Rmd`: it does not
+touch grid_visits, OD, covisit, or daytime outputs. Existing waves with
+`grid_visits.feather` are left intact; this just fills the two new CSVs
+without re-running the heavy pipeline.
+
+```{r init}
+load_pipeline()
+library(data.table); library(arrow); library(jsonlite); library(duckdb)
+library(DBI)
+
+# Reuse helpers from 03 by sourcing only what's needed.
+parse_json_safe <- function(x) tryCatch(fromJSON(x), error = function(e) NULL)
+
+select_files_for_range <- function(advan_files, wave_start, wave_end) {
+  bn <- basename(advan_files); pk <- substr(bn, 1, 10)
+  ok <- suppressWarnings(!is.na(as.Date(pk, format = "%Y-%m-%d")))
+  pk <- as.Date(pk[ok], format = "%Y-%m-%d")
+  files <- advan_files[ok]
+  files[(pk + 6) >= wave_start & pk <= wave_end]
+}
+```
+
+# Extract
+
+```{r extract}
+extract_diurnal_dwell <- function(wave_id, wave_months) {
+  out_dir <- get_wave_dir(state, wave_id)
+  inter   <- file.path(out_dir, "intermediate")
+  dir.create(inter, recursive = TRUE, showWarnings = FALSE)
+
+  f_diurnal <- file.path(inter, "diurnal_profile.csv")
+  f_dwell   <- file.path(inter, "dwell_buckets.csv")
+  if (file.exists(f_diurnal) && file.exists(f_dwell)) {
+    message(sprintf("[%s/%s] already populated, skipping", state, wave_id))
+    return(invisible(NULL))
+  }
+
+  fips_5 <- get_metro_fips(state, 5)
+  wdr    <- get_wave_date_range(wave_months)
+  advan_files <- list.files(CONFIG$advan_dir, pattern = "\\.parquet$",
+                            full.names = TRUE)
+  wave_files <- select_files_for_range(advan_files, wdr$start, wdr$end)
+  message(sprintf("[%s/%s] %d weekly files in [%s, %s]",
+                  state, wave_id, length(wave_files), wdr$start, wdr$end))
+  if (length(wave_files) == 0) return(invisible(NULL))
+
+  con <- dbConnect(duckdb(), dbdir = ":memory:")
+  on.exit(dbDisconnect(con, shutdown = TRUE), add = TRUE)
+  fsql <- paste0("'", fips_5, "'", collapse = ", ")
+  region_filter <- if (state == "UT") "REGION = 'UT'" else "REGION = 'NY'"
+  files_glob <- paste0("'", paste(wave_files, collapse = "','"), "'")
+
+  q <- sprintf("
+    SELECT
+      COALESCE(CAST(VISITS_BY_EACH_HOUR  AS VARCHAR),'') AS vbeh,
+      COALESCE(CAST(BUCKETED_DWELL_TIMES AS VARCHAR),'') AS bdt
+    FROM read_parquet([%s])
+    WHERE %s
+      AND SUBSTR(CAST(POI_CBG AS VARCHAR),1,5) IN (%s)
+      AND VISIT_COUNTS > 0
+      AND (IS_DISTRIBUTOR IS NULL OR IS_DISTRIBUTOR != 1)",
+    files_glob, region_filter, fsql)
+  rows <- as.data.table(dbGetQuery(con, q))
+  message(sprintf("  read %s weekly POI rows", fmt(nrow(rows))))
+  if (!nrow(rows)) return(invisible(NULL))
+
+  # Diurnal: sum the 168-vec across all rows.
+  vbeh_acc <- numeric(168)
+  for (j in rows$vbeh) {
+    if (!nzchar(j) || nchar(j) < 3) next
+    v <- suppressWarnings(as.numeric(parse_json_safe(j)))
+    if (length(v) < 168) next
+    v <- v[1:168]; v[is.na(v)] <- 0
+    vbeh_acc <- vbeh_acc + v
+  }
+  if (sum(vbeh_acc) > 0) {
+    diurnal_dt <- data.table(
+      dow    = rep(0:6, each = 24),
+      hour   = rep(0:23, times = 7),
+      visits = vbeh_acc)
+    fwrite(diurnal_dt, f_diurnal)
+    message(sprintf("  wrote %s", basename(f_diurnal)))
+  }
+
+  # Dwell: sum bucket counts across all rows.
+  dwell_acc <- list()
+  for (j in rows$bdt) {
+    if (!nzchar(j) || nchar(j) < 3) next
+    p <- parse_json_safe(j)
+    if (is.null(p) || length(p) == 0) next
+    nms  <- names(p); if (is.null(nms)) next
+    vals <- suppressWarnings(as.numeric(unlist(p)))
+    keep <- !is.na(vals) & nzchar(nms)
+    for (i in which(keep)) {
+      k <- nms[i]
+      dwell_acc[[k]] <- (if (is.null(dwell_acc[[k]])) 0 else dwell_acc[[k]]) + vals[i]
+    }
+  }
+  if (length(dwell_acc) > 0) {
+    dwell_dt <- data.table(bucket = names(dwell_acc),
+                           count  = as.numeric(unlist(dwell_acc)))
+    fwrite(dwell_dt, f_dwell)
+    message(sprintf("  wrote %s", basename(f_dwell)))
+  }
+  invisible(NULL)
+}
+```
+
+# Run All
+
+```{r run_all}
+invisible(run_waves_by_state(extract_diurnal_dwell))
+```

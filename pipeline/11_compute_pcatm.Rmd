@@ -1,0 +1,734 @@
+---
+title: "Proportion of Cases Attributable to Mobility (PCAtM)"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+source(here::here("helpers/_utils.R"))
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 12, fig.height = 8)
+suppressPackageStartupMessages({
+  library(data.table)
+  library(sf)
+  library(ggplot2)
+  library(patchwork)
+  library(scales)
+})
+
+load_pipeline()
+```
+
+# Overview
+
+Adapted from Slater et al. (2025, AOAS) but applied to a Bayesian log-linear
+grid-time model fit with INLA rather than the AOAS Stan/NUTS endemic-epidemic
+model. The ST_IV linear predictor is:
+
+$$\log(\mu_{it}) = \text{offset}_{it} + \beta_0 + \sum_j \beta_j x_{j,it} + u_i + v_i + \gamma_t + \delta_{it}$$
+
+Grid-level PCAtM: $\text{PCAtM}_{it} = 1 - \exp(-\eta_{\text{mob},it})$
+(counterfactual share of fitted cases attributable to the mobility block;
+analogous to the reproduction-number-share PCAtM of AOAS Eq. 4 for the
+endemic-epidemic class).
+
+Wave-level aggregate (avoids Jensen's inequality):
+
+$$\text{AMLP} = \frac{\sum \hat\mu \cdot \eta_{\text{mob}}}{\sum \hat\mu}, \quad \text{PCAtM}_{\text{wave}} \approx 1 - \exp(-\text{AMLP})$$
+
+Because AMLP is linear in $\beta$, posterior credible intervals propagate
+analytically from the saved INLA marginals: with $\bar x_j = \sum \hat\mu x_{j}
+/ \sum \hat\mu$ (case-weighted mean of covariate $j$),
+$\text{AMLP} \sim \mathcal N\!\big(\sum_j \bar x_j \hat\beta_j,\;
+\sqrt{\sum_j \bar x_j^{2}\,\hat\sigma_{\beta_j}^{2}}\big)$,
+assuming approximate posterior independence of the fixed-effect marginals.
+Grid- and date-level CrI follow the same form with weights restricted to the
+corresponding subset.
+
+Three tiers:
+
+- **Narrow**: OD infection pressure only (lower bound)
+- **Broad**: all explicit mobility covariates
+- **Extended**: all Advan-derived covariates (upper bound)
+
+The gap between Broad and Extended quantifies "hidden" mobility signal leakage
+through Advan-derived structural covariates (activity density, dwell exposure, etc.).
+
+# Configuration
+
+```{r config}
+BASE <- CONFIG$output_dir
+
+PCATM_DIR <- file.path("outputs", "pcatm")
+dir.create(PCATM_DIR, recursive = TRUE, showWarnings = FALSE)
+
+DPI <- 300
+
+WAVE_COLS <- c(
+  NY_wave1 = "#2166AC", NY_wave2 = "#4393C3", NY_wave3 = "#92C5DE",
+  UT_wave1 = "#B2182B", UT_wave2 = "#D6604D", UT_wave3 = "#F4A582"
+)
+WAVE_LABS <- c(
+  NY_wave1 = "NYC Wave 1", NY_wave2 = "NYC Wave 2", NY_wave3 = "NYC Wave 3",
+  UT_wave1 = "Utah Wave 1", UT_wave2 = "Utah Wave 2", UT_wave3 = "Utah Wave 3"
+)
+
+THEME_PUB <- theme_minimal(base_size = 10) +
+  theme(
+    plot.title       = element_text(face = "bold", hjust = 0.5, size = 11),
+    plot.subtitle    = element_text(hjust = 0.5, color = "grey40", size = 8),
+    strip.text       = element_text(face = "bold", size = 9),
+    panel.grid.minor = element_blank(),
+    legend.position  = "bottom",
+    legend.key.width = unit(1.2, "cm")
+  )
+
+THEME_MAP <- theme_void(base_size = 9) +
+  theme(
+    plot.title    = element_text(face = "bold", hjust = 0.5, size = 10),
+    plot.subtitle = element_text(hjust = 0.5, color = "grey40", size = 7),
+    panel.border  = element_rect(color = "grey30", fill = NA, linewidth = 0.4),
+    legend.position = "right"
+  )
+```
+
+# Mobility Covariate Definitions
+
+```{r mob-definitions}
+MOB_FIXED_COVS <- c(
+  "inf_pressure_std",
+  "contact_intensity_std",
+  "mob_spatial_lag_std",
+  "mob_lag3", "mob_lag5", "mob_lag7", "mob_lag14", "mob_lag21",
+  "exposure_import_std",
+  "activity_x_weekend"
+)
+
+NARROW_COVS <- c("inf_pressure_std")
+
+ADVAN_STRUCTURAL_COVS <- c(
+  "log_activity_density_std",
+  "dwell_exposure_std",
+  "avg_category_risk_std",
+  "log_visit_density_std",
+  "hourly_concentration_std",
+  "daily_visit_cv_std",
+  "log_repeat_ratio_std",
+  "log_contact_density_hourly_std",
+  "log_effective_hours_std",
+  "log_daytime_pop_std",
+  "daytime_pop_ratio_std",
+  "log_distance_from_home_std",
+  "ses_contrast_std",
+  "weekend_excess_std",
+  "weekday_dominance_std"
+)
+
+EXTENDED_COVS <- unique(c(MOB_FIXED_COVS, ADVAN_STRUCTURAL_COVS))
+
+reconstruct_mob_columns <- function(gt_dt, grid_sf) {
+  df <- as.data.frame(gt_dt)
+  active_ids <- unique(df$grid_id)
+  grid_active <- grid_sf[grid_sf$grid_id %in% active_ids, ]
+  grid_active <- grid_active[order(match(grid_active$grid_id, sort(active_ids))), ]
+  df <- add_spatial_orthogonalization(df, grid_active)
+  df <- add_temporal_centering(df)
+  df <- add_temporal_lags(df)
+  as.data.table(df)
+}
+```
+
+# Computation
+
+```{r compute}
+RUNS <- c("NY_wave1", "NY_wave2", "NY_wave3",
+           "UT_wave1", "UT_wave2", "UT_wave3")
+
+grid_ny <- st_read(file.path(BASE, "grids", "grid_100m_NY.gpkg"), quiet = TRUE)
+grid_ut <- st_read(file.path(BASE, "grids", "grid_100m_UT.gpkg"), quiet = TRUE)
+
+all_results <- list()
+decomp_list <- list()
+
+# Analytical AMLP mean/sd from case-weighted beta marginals.
+amlp_normal <- function(xbar, beta_mean, beta_sd) {
+  list(
+    mean = sum(xbar * beta_mean),
+    sd   = sqrt(sum(xbar^2 * beta_sd^2))
+  )
+}
+ci_amlp <- function(amlp) {
+  list(
+    q025 = amlp$mean + qnorm(0.025) * amlp$sd,
+    q975 = amlp$mean + qnorm(0.975) * amlp$sd
+  )
+}
+
+for (run in RUNS) {
+  state   <- sub("_wave.*", "", run)
+  grid_sf <- if (state == "NY") grid_ny else grid_ut
+
+  run_dir <- file.path(PCATM_DIR, run)
+  cached_spatial  <- file.path(run_dir, "pcatm_spatial.csv")
+  cached_temporal <- file.path(run_dir, "pcatm_temporal.csv")
+  cached_wave     <- file.path(run_dir, "pcatm_wave_summary.csv")
+  if (all(file.exists(cached_spatial, cached_temporal, cached_wave)) &&
+      !identical(Sys.getenv("PCATM_FORCE"), "1")) {
+    message(sprintf("[%s] cached outputs found in %s; reloading and skipping recompute.", run, run_dir))
+    all_results[[run]] <- list(
+      spatial      = fread(cached_spatial),
+      temporal     = fread(cached_temporal),
+      wave         = fread(cached_wave),
+      state        = state,
+      run          = run,
+      mob_broad    = NA_character_,
+      mob_extended = NA_character_
+    )
+    gc(full = TRUE)
+    next
+  }
+
+  md  <- readRDS(file.path(BASE, run, "models", "model_data_gt.rds"))
+  res <- readRDS(file.path(BASE, run, "models", "model_results_unified.rds"))
+
+  best    <- res$best_model
+  fe      <- res$model_outputs[[best]]$fixed_effects
+  fv_best <- as.data.table(res$model_outputs[[best]]$fitted_values)
+  fv_base <- as.data.table(res$model_outputs$Base$fitted_values)
+
+  dt <- reconstruct_mob_columns(md$gt_dt, grid_sf)
+
+  model_covs   <- fe$covariate
+  mob_broad    <- intersect(MOB_FIXED_COVS, model_covs)
+  mob_narrow   <- intersect(NARROW_COVS, model_covs)
+  mob_extended <- intersect(EXTENDED_COVS, model_covs)
+
+  dt[, eta_broad    := 0]
+  dt[, eta_narrow   := 0]
+  dt[, eta_extended := 0]
+
+  for (cov in mob_extended) {
+    beta_j <- fe[covariate == cov, mean]
+    x_j    <- dt[[cov]]
+    x_j[is.na(x_j)] <- 0
+
+    dt[, eta_extended := eta_extended + beta_j * x_j]
+    if (cov %in% mob_broad)  dt[, eta_broad  := eta_broad  + beta_j * x_j]
+    if (cov %in% mob_narrow) dt[, eta_narrow := eta_narrow + beta_j * x_j]
+  }
+
+  # Build PCAtM table
+  pcatm_dt <- data.table(
+    grid_id     = fv_best$grid_id,
+    time_id     = fv_best$time_id,
+    fitted      = fv_best$fitted_mean,
+    fitted_base = fv_base$fitted_mean,
+    Y           = fv_best$Y
+  )
+
+  eta_lkp <- dt[, .(grid_id, time_id, eta_broad, eta_narrow, eta_extended)]
+  pcatm_dt <- merge(pcatm_dt, eta_lkp, by = c("grid_id", "time_id"))
+
+  time_lkp <- md$time_lookup[, .(time_id, date)]
+  pcatm_dt <- merge(pcatm_dt, time_lkp, by = "time_id")
+
+  pcatm_dt[, pcatm_broad    := 1 - exp(-eta_broad)]
+  pcatm_dt[, pcatm_narrow   := 1 - exp(-eta_narrow)]
+  pcatm_dt[, pcatm_extended := 1 - exp(-eta_extended)]
+  pcatm_dt[, mob_RR_model   := fitted / fitted_base]
+
+  # Linearised PCAtM fallback for extreme eta values.
+  pcatm_dt[, pcatm_lin_broad    := eta_broad]
+  pcatm_dt[, pcatm_lin_narrow   := eta_narrow]
+  pcatm_dt[, pcatm_lin_extended := eta_extended]
+  pcatm_dt[, attr_cases_lin_broad    := fitted * eta_broad]
+  pcatm_dt[, attr_cases_lin_narrow   := fitted * eta_narrow]
+  pcatm_dt[, attr_cases_lin_extended := fitted * eta_extended]
+
+  # Case-weighted covariate means for AMLP and CrI.
+  total_fitted <- sum(pcatm_dt$fitted)
+  cov_lkp <- merge(
+    dt[, c("grid_id", "time_id", mob_extended), with = FALSE],
+    pcatm_dt[, .(grid_id, time_id, fitted)],
+    by = c("grid_id", "time_id")
+  )
+  xbar <- vapply(mob_extended, function(cv) {
+    x <- cov_lkp[[cv]]; x[is.na(x)] <- 0
+    sum(cov_lkp$fitted * x) / total_fitted
+  }, numeric(1))
+  names(xbar) <- mob_extended
+
+  beta_mean <- setNames(fe$mean, fe$covariate)[mob_extended]
+  beta_sd   <- setNames(fe$sd,   fe$covariate)[mob_extended]
+
+  amlp_ext <- amlp_normal(xbar[mob_extended], beta_mean[mob_extended], beta_sd[mob_extended])
+  amlp_brd <- amlp_normal(xbar[mob_broad],    beta_mean[mob_broad],    beta_sd[mob_broad])
+  amlp_nar <- amlp_normal(xbar[mob_narrow],   beta_mean[mob_narrow],   beta_sd[mob_narrow])
+  ci_ext   <- ci_amlp(amlp_ext)
+  ci_brd   <- ci_amlp(amlp_brd)
+  ci_nar   <- ci_amlp(amlp_nar)
+
+  AMLP_narrow   <- amlp_nar$mean
+  AMLP_broad    <- amlp_brd$mean
+  AMLP_extended <- amlp_ext$mean
+
+  wave_pcatm <- data.table(
+    AMLP_narrow         = AMLP_narrow,
+    AMLP_narrow_q025    = ci_nar$q025,
+    AMLP_narrow_q975    = ci_nar$q975,
+    pcatm_narrow        = 1 - exp(-AMLP_narrow),
+    pcatm_narrow_q025   = 1 - exp(-ci_nar$q025),
+    pcatm_narrow_q975   = 1 - exp(-ci_nar$q975),
+    AMLP_broad          = AMLP_broad,
+    AMLP_broad_q025     = ci_brd$q025,
+    AMLP_broad_q975     = ci_brd$q975,
+    pcatm_broad         = 1 - exp(-AMLP_broad),
+    pcatm_broad_q025    = 1 - exp(-ci_brd$q025),
+    pcatm_broad_q975    = 1 - exp(-ci_brd$q975),
+    AMLP_extended       = AMLP_extended,
+    AMLP_extended_q025  = ci_ext$q025,
+    AMLP_extended_q975  = ci_ext$q975,
+    pcatm_extended      = 1 - exp(-AMLP_extended),
+    pcatm_extended_q025 = 1 - exp(-ci_ext$q025),
+    pcatm_extended_q975 = 1 - exp(-ci_ext$q975),
+    # Linearised PCAtM = AMLP fallback when the exponential form is unstable.
+    pcatm_lin_narrow    = AMLP_narrow,
+    pcatm_lin_broad     = AMLP_broad,
+    pcatm_lin_extended  = AMLP_extended,
+    pct_positive        = 100 * mean(pcatm_dt$eta_broad > 0),
+    pct_negative        = 100 * mean(pcatm_dt$eta_broad < 0),
+    pct_positive_ext    = 100 * mean(pcatm_dt$eta_extended > 0),
+    pct_negative_ext    = 100 * mean(pcatm_dt$eta_extended < 0),
+    median_pcatm        = median(pcatm_dt$pcatm_broad),
+    model_ratio         = total_fitted / sum(pcatm_dt$fitted_base),
+    n_mob_broad         = length(mob_broad),
+    n_extended          = length(mob_extended)
+  )
+
+  # Spatial PCAtM summary with analytical broad-PCAtM CrI.
+  spatial_xbar <- cov_lkp[, lapply(.SD, function(x) {
+    x[is.na(x)] <- 0; sum(fitted * x) / sum(fitted)
+  }), by = grid_id, .SDcols = mob_broad]
+
+  bm_broad <- beta_mean[mob_broad]
+  bs_broad <- beta_sd[mob_broad]
+  xmat <- as.matrix(spatial_xbar[, ..mob_broad])
+  spatial_xbar[, eta_broad_mean := as.numeric(xmat %*% bm_broad)]
+  spatial_xbar[, eta_broad_sd   := sqrt(as.numeric((xmat^2) %*% (bs_broad^2)))]
+  spatial_xbar[, eta_broad_q025 := eta_broad_mean + qnorm(0.025) * eta_broad_sd]
+  spatial_xbar[, eta_broad_q975 := eta_broad_mean + qnorm(0.975) * eta_broad_sd]
+
+  spatial_pcatm <- pcatm_dt[, .(
+    mean_eta_broad  = mean(eta_broad),
+    mean_eta_narrow = mean(eta_narrow),
+    pcatm_broad     = 1 - exp(-mean(eta_broad)),
+    pcatm_narrow    = 1 - exp(-mean(eta_narrow)),
+    total_fitted    = sum(fitted),
+    mob_RR_model    = sum(fitted) / sum(fitted_base),
+    total_obs       = sum(Y)
+  ), by = grid_id]
+  spatial_pcatm <- merge(
+    spatial_pcatm,
+    spatial_xbar[, .(grid_id, eta_broad_q025, eta_broad_q975)],
+    by = "grid_id", all.x = TRUE
+  )
+  spatial_pcatm[, pcatm_broad_q025 := 1 - exp(-eta_broad_q025)]
+  spatial_pcatm[, pcatm_broad_q975 := 1 - exp(-eta_broad_q975)]
+  spatial_pcatm[, pcatm_broad_significant := (eta_broad_q025 > 0) | (eta_broad_q975 < 0)]
+  # Linearised PCAtM aliases (per-grid case-weighted eta)
+  spatial_pcatm[, pcatm_lin_broad  := mean_eta_broad]
+  spatial_pcatm[, pcatm_lin_narrow := mean_eta_narrow]
+
+  # Temporal PCAtM summary with analytical broad-PCAtM CrI.
+  temporal_join <- merge(
+    cov_lkp,
+    pcatm_dt[, .(grid_id, time_id, date)],
+    by = c("grid_id", "time_id")
+  )
+  temporal_xbar <- temporal_join[, lapply(.SD, function(x) {
+    x[is.na(x)] <- 0; sum(fitted * x) / sum(fitted)
+  }), by = date, .SDcols = mob_broad]
+  tmat <- as.matrix(temporal_xbar[, ..mob_broad])
+  temporal_xbar[, eta_broad_sd := sqrt(as.numeric((tmat^2) %*% (bs_broad^2)))]
+
+  temporal_pcatm <- pcatm_dt[, .(
+    AMLP_broad   = sum(fitted * eta_broad) / sum(fitted),
+    AMLP_narrow  = sum(fitted * eta_narrow) / sum(fitted),
+    total_fitted = sum(fitted),
+    total_base   = sum(fitted_base),
+    total_obs    = sum(Y)
+  ), by = date]
+  temporal_pcatm <- merge(
+    temporal_pcatm,
+    temporal_xbar[, .(date, eta_broad_sd)],
+    by = "date", all.x = TRUE
+  )
+  temporal_pcatm[, AMLP_broad_q025 := AMLP_broad + qnorm(0.025) * eta_broad_sd]
+  temporal_pcatm[, AMLP_broad_q975 := AMLP_broad + qnorm(0.975) * eta_broad_sd]
+  temporal_pcatm[, pcatm_broad      := 1 - exp(-AMLP_broad)]
+  temporal_pcatm[, pcatm_broad_q025 := 1 - exp(-AMLP_broad_q025)]
+  temporal_pcatm[, pcatm_broad_q975 := 1 - exp(-AMLP_broad_q975)]
+  temporal_pcatm[, pcatm_narrow     := 1 - exp(-AMLP_narrow)]
+  # Linearised PCAtM aliases (per-day case-weighted eta)
+  temporal_pcatm[, pcatm_lin_broad  := AMLP_broad]
+  temporal_pcatm[, pcatm_lin_narrow := AMLP_narrow]
+  setorder(temporal_pcatm, date)
+
+  # Per-covariate decomposition
+  decomp_cols <- intersect(mob_extended, names(dt))
+  decomp_merge <- merge(
+    dt[, c("grid_id", "time_id", decomp_cols), with = FALSE],
+    pcatm_dt[, .(grid_id, time_id, fitted)],
+    by = c("grid_id", "time_id")
+  )
+  for (cov in decomp_cols) {
+    beta_j <- fe[covariate == cov, mean]
+    x_j <- decomp_merge[[cov]]
+    x_j[is.na(x_j)] <- 0
+    amlp_j <- sum(decomp_merge$fitted * beta_j * x_j) / sum(decomp_merge$fitted)
+    decomp_list[[paste0(run, "_", cov)]] <- data.table(
+      component = cov,
+      tier  = ifelse(cov %in% MOB_FIXED_COVS, "Explicit mobility",
+                     "Advan-derived structural"),
+      beta  = beta_j,
+      amlp  = amlp_j,
+      pcatm = 1 - exp(-amlp_j),
+      wave  = run
+    )
+  }
+
+  # Save CSVs
+  run_dir <- file.path(PCATM_DIR, run)
+  dir.create(run_dir, recursive = TRUE, showWarnings = FALSE)
+  fwrite(spatial_pcatm,  file.path(run_dir, "pcatm_spatial.csv"))
+  fwrite(temporal_pcatm, file.path(run_dir, "pcatm_temporal.csv"))
+  fwrite(wave_pcatm,     file.path(run_dir, "pcatm_wave_summary.csv"))
+
+  all_results[[run]] <- list(
+    spatial      = spatial_pcatm,
+    temporal     = temporal_pcatm,
+    wave         = wave_pcatm,
+    state        = state,
+    run          = run,
+    mob_broad    = mob_broad,
+    mob_extended = mob_extended
+  )
+
+  # Free heavy intermediates before the next wave.
+  rm(md, res, dt, fv_best, fv_base)
+  if (exists("spatial_join"))   rm(spatial_join)
+  if (exists("temporal_join"))  rm(temporal_join)
+  if (exists("cov_lkp"))        rm(cov_lkp)
+  gc(full = TRUE)
+}
+```
+
+# Summary
+
+```{r summary}
+summary_dt <- rbindlist(lapply(all_results, function(r) {
+  data.table(
+    wave             = r$run,
+    state            = r$state,
+    AMLP_narrow      = r$wave$AMLP_narrow,
+    pcatm_narrow     = r$wave$pcatm_narrow,
+    pcatm_narrow_q025   = r$wave$pcatm_narrow_q025,
+    pcatm_narrow_q975   = r$wave$pcatm_narrow_q975,
+    AMLP_broad       = r$wave$AMLP_broad,
+    pcatm_broad      = r$wave$pcatm_broad,
+    pcatm_broad_q025    = r$wave$pcatm_broad_q025,
+    pcatm_broad_q975    = r$wave$pcatm_broad_q975,
+    AMLP_extended    = r$wave$AMLP_extended,
+    pcatm_extended   = r$wave$pcatm_extended,
+    pcatm_extended_q025 = r$wave$pcatm_extended_q025,
+    pcatm_extended_q975 = r$wave$pcatm_extended_q975,
+    pct_positive     = r$wave$pct_positive,
+    pct_negative     = r$wave$pct_negative,
+    pct_positive_ext = r$wave$pct_positive_ext,
+    pct_negative_ext = r$wave$pct_negative_ext,
+    median_pcatm     = r$wave$median_pcatm,
+    n_mob_broad      = r$wave$n_mob_broad,
+    n_extended       = r$wave$n_extended
+  )
+}))
+print(summary_dt, digits = 4)
+fwrite(summary_dt, file.path(PCATM_DIR, "pcatm_summary_all.csv"))
+```
+
+# OD Kernel Fit Across Waves
+
+Cross-wave comparison of the fitted distance-decay kernel ($\sigma$, $\alpha$
+of the Meyer-Held power-law $f(d) = (1 + d/\sigma)^{-\alpha}$) and the AIC
+contrast against a Gaussian alternative. Variant-by-wave shifts in the
+fitted exponent are the empirical analogue of Slater 2025 \S 5's
+"variant-adjusted $\alpha$" recommendation.
+
+```{r kernel-fit-summary}
+kernel_files <- vapply(RUNS, function(r) {
+  state <- sub("_wave.*", "", r); wid <- sub("^.*_", "", r)
+  file.path(BASE, r, "tables", "od_kernel_fit.csv")
+}, character(1))
+kernel_files <- kernel_files[file.exists(kernel_files)]
+if (length(kernel_files) > 0) {
+  kfit_dt <- rbindlist(lapply(kernel_files, fread), fill = TRUE)
+  # dAIC vs best non-power-law alternative
+  kfit_dt[, dAIC_vs_gauss := aic_powerlaw - aic_gauss]
+  kfit_dt[, dAIC_vs_tpl   := aic_powerlaw - aic_tpowerlaw]
+  print(kfit_dt[, .(state, wave_id, sigma_m, alpha, kappa_m,
+                    aic_powerlaw, aic_tpowerlaw, aic_gauss,
+                    dAIC_vs_tpl, chosen_form, n_pairs)],
+        digits = 4)
+  fwrite(kfit_dt, file.path(PCATM_DIR, "od_kernel_fit_all.csv"))
+} else {
+  message("No od_kernel_fit.csv files found - re-run 06 first.")
+}
+```
+
+# Spatial Maps
+
+```{r fig-spatial, fig.width=14, fig.height=5.5}
+for (area in c("NY", "UT")) {
+  grid_sf    <- if (area == "NY") grid_ny else grid_ut
+  area_runs  <- grep(paste0("^", area), names(all_results), value = TRUE)
+
+  all_sp <- rbindlist(lapply(area_runs, function(r)
+    all_results[[r]]$spatial[, .(grid_id, pcatm_broad, wave = r)]))
+
+  lim  <- min(quantile(abs(all_sp$pcatm_broad), 0.95, na.rm = TRUE), 1.0)
+  clim <- c(-lim, lim)
+
+  map_list <- lapply(area_runs, function(run) {
+    sp <- all_results[[run]]$spatial
+    g  <- merge(grid_sf, sp, by = "grid_id", all.x = FALSE)
+    g$pcatm_plot <- pmin(pmax(g$pcatm_broad, clim[1]), clim[2])
+
+    ggplot(g) +
+      geom_sf(aes(fill = pcatm_plot), color = NA) +
+      scale_fill_distiller(palette = "RdBu", direction = -1, limits = clim,
+                           labels = percent_format(accuracy = 1), name = "PCAtM") +
+      ggtitle(WAVE_LABS[run]) + THEME_MAP
+  })
+
+  combined <- wrap_plots(map_list, ncol = 3) +
+    plot_annotation(
+      title = paste0(ifelse(area == "NY", "New York City", "Utah"),
+                     " \u2014 Mobility-Attributable Fraction (Broad)"),
+      theme = theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 13))
+    )
+
+  w <- if (area == "NY") 14 else 16
+  h <- if (area == "NY") 5.5 else 5
+  ggsave(file.path(PCATM_DIR, paste0(tolower(area), "_pcatm_spatial.png")),
+         combined, width = w, height = h, dpi = DPI)
+  print(combined)
+}
+```
+
+# Temporal Time Series
+
+```{r fig-temporal, fig.width=10, fig.height=5}
+for (area in c("NY", "UT")) {
+  area_runs <- grep(paste0("^", area), names(all_results), value = TRUE)
+
+  temp_dt <- rbindlist(lapply(area_runs, function(r) {
+    d <- copy(all_results[[r]]$temporal)
+    d[, wave := r]
+    d[, wave_lab := WAVE_LABS[r]]
+    d <- d[order(date)][8:.N]
+    d
+  }))
+
+  temp_dt[order(date), pcatm_smooth := frollmean(pcatm_broad, 7, align = "center"),
+          by = wave]
+  temp_dt[is.na(pcatm_smooth), pcatm_smooth := pcatm_broad]
+  has_ci <- all(c("pcatm_broad_q025", "pcatm_broad_q975") %in% names(temp_dt))
+  if (has_ci) {
+    temp_dt[order(date), pcatm_lo := frollmean(pcatm_broad_q025, 7, align = "center"), by = wave]
+    temp_dt[order(date), pcatm_hi := frollmean(pcatm_broad_q975, 7, align = "center"), by = wave]
+    temp_dt[is.na(pcatm_lo), pcatm_lo := pcatm_broad_q025]
+    temp_dt[is.na(pcatm_hi), pcatm_hi := pcatm_broad_q975]
+  }
+
+  p <- ggplot(temp_dt, aes(x = as.Date(date), y = pcatm_smooth,
+                            color = wave_lab, fill = wave_lab, group = wave)) +
+    {if (has_ci) geom_ribbon(aes(ymin = pcatm_lo, ymax = pcatm_hi),
+                              alpha = 0.18, color = NA)} +
+    geom_line(linewidth = 0.8) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+    scale_y_continuous(labels = percent_format(accuracy = 1)) +
+    scale_fill_manual(values = setNames(WAVE_COLS[area_runs],
+                                         WAVE_LABS[area_runs]), guide = "none") +
+    scale_color_manual(values = setNames(WAVE_COLS[area_runs],
+                                          WAVE_LABS[area_runs])) +
+    labs(
+      title = paste0(ifelse(area == "NY", "New York City", "Utah"),
+                     " \u2014 Daily PCAtM (Case-Weighted, Broad)"),
+      x = "Date", y = "PCAtM", color = NULL
+    ) +
+    THEME_PUB
+
+  ggsave(file.path(PCATM_DIR, paste0(tolower(area), "_pcatm_temporal.png")),
+         p, width = 10, height = 5, dpi = DPI)
+  print(p)
+}
+```
+
+# Three-Tier Comparison
+
+```{r fig-comparison, fig.width=11, fig.height=6}
+bar_dt <- melt(summary_dt,
+               id.vars = c("wave", "state"),
+               measure.vars = intersect(
+                 c("pcatm_narrow", "pcatm_broad", "pcatm_extended"),
+                 names(summary_dt)),
+               variable.name = "definition",
+               value.name = "pcatm")
+bar_dt[, definition := fcase(
+  definition == "pcatm_narrow",      "Narrow (OD infection pressure only)",
+  definition == "pcatm_broad",       "Broad (6 explicit mobility covariates)",
+  definition == "pcatm_extended",    "Extended (all Advan-derived covariates)"
+)]
+bar_dt[, definition := factor(definition, levels = c(
+  "Narrow (OD infection pressure only)",
+  "Broad (6 explicit mobility covariates)",
+  "Extended (all Advan-derived covariates)"
+))]
+bar_dt[, wave_lab := WAVE_LABS[wave]]
+
+p_bar <- ggplot(bar_dt, aes(x = wave_lab, y = pcatm, fill = definition)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.65) +
+  geom_hline(yintercept = 0, color = "grey40") +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_fill_manual(values = c(
+    "Narrow (OD infection pressure only)"        = "#92C5DE",
+    "Broad (6 explicit mobility covariates)"     = "#2166AC",
+    "Extended (all Advan-derived covariates)"    = "#B2182B"
+  )) +
+  labs(
+    title = "PCAtM Sensitivity: Three Tiers of Mobility Attribution",
+    subtitle = "Case-weighted: 1 \u2212 exp(\u2212AMLP).",
+    x = NULL, y = "PCAtM", fill = NULL
+  ) +
+  THEME_PUB +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+ggsave(file.path(PCATM_DIR, "pcatm_comparison.png"),
+       p_bar, width = 11, height = 6, dpi = DPI)
+print(p_bar)
+```
+
+# Covariate Decomposition
+
+```{r fig-decomposition, fig.width=12, fig.height=9}
+NICE_NAMES <- c(
+  inf_pressure_std               = "Infection Pressure",
+  contact_intensity_std          = "Contact Intensity",
+  mob_spatial_lag_std             = "Mobility Spatial Lag",
+  mob_lag3                       = "Mobility Lag (3-day)",
+  mob_lag5                       = "Mobility Lag (5-day)",
+  mob_lag7                       = "Mobility Lag (7-day)",
+  mob_lag14                      = "Mobility Lag (14-day)",
+  mob_lag21                      = "Mobility Lag (21-day)",
+  exposure_import_std            = "Exposure Import",
+  activity_x_weekend             = "Activity \u00d7 Weekend",
+  log_activity_density_std       = "Activity Density*",
+  dwell_exposure_std             = "Dwell Exposure*",
+  avg_category_risk_std          = "Venue Risk Score*",
+  log_visit_density_std          = "Visit Density*",
+  hourly_concentration_std       = "Hourly Concentration*",
+  daily_visit_cv_std             = "Daily Visit CV*",
+  log_repeat_ratio_std           = "Repeat Ratio*",
+  log_contact_density_hourly_std = "Contact Density/hr*",
+  log_effective_hours_std        = "Effective Hours*",
+  log_daytime_pop_std            = "Daytime Population*",
+  daytime_pop_ratio_std          = "Daytime Pop Ratio*",
+  log_distance_from_home_std     = "Distance from Home*",
+  ses_contrast_std               = "SES Contrast (iOS)*",
+  weekend_excess_std             = "Weekend Excess*",
+  weekday_dominance_std          = "Weekday Dominance*"
+)
+
+# Note: nonlinear-mobility runs (NLMob, NLMob_ST_IV) carry no linear beta for
+# their smoothed covariate, so those covariates drop out of this decomposition
+# (e.g. inf_pressure_std for NYC Wave 1). Per-covariate contributions are
+# linear-projection AMLP only.
+decomp_dt <- rbindlist(decomp_list, fill = TRUE)
+decomp_dt[, nice_name := NICE_NAMES[component]]
+decomp_dt[is.na(nice_name), nice_name := component]
+decomp_dt[, wave_lab := WAVE_LABS[wave]]
+decomp_dt[, area := ifelse(grepl("^NY", wave), "NYC", "Utah")]
+
+# Persist so future replots do not need a full pipeline rerun.
+fwrite(decomp_dt, file.path(PCATM_DIR, "pcatm_decomposition.csv"))
+
+comp_order <- decomp_dt[, .(avg_abs = mean(abs(amlp), na.rm = TRUE)),
+                       by = nice_name][order(avg_abs)]
+decomp_dt[, nice_name := factor(nice_name, levels = comp_order$nice_name)]
+
+p_decomp <- ggplot(decomp_dt, aes(x = nice_name, y = amlp, fill = wave_lab)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6) +
+  geom_hline(yintercept = 0, color = "grey40") +
+  coord_flip() +
+  facet_grid(tier ~ area, scales = "free", space = "free_y") +
+  scale_fill_manual(values = setNames(WAVE_COLS, WAVE_LABS[names(WAVE_COLS)])) +
+  labs(
+    title = "Decomposition of Advan-Derived Covariate Contributions (Case-Weighted AMLP)",
+    subtitle = "Top: explicit mobility covariates (PCAtM Broad). Bottom: Advan-derived structural covariates (*).\nSeparate x-scales per area so NYC contributions are not crushed by the Utah exposure-import tail.\nNLMob-smoothed covariates (e.g. NYC Wave 1 infection pressure) carry no linear beta and are omitted.",
+    x = NULL, y = "AMLP contribution", fill = NULL
+  ) +
+  THEME_PUB
+
+ggsave(file.path(PCATM_DIR, "pcatm_decomposition.png"),
+       p_decomp, width = 13, height = 9, dpi = DPI)
+print(p_decomp)
+```
+
+# Model Comparison Maps
+
+Between-model comparison: spatial relative risk from ST_IV vs Base.
+
+```{r fig-model-comparison, fig.width=14, fig.height=5.5}
+for (area in c("NY", "UT")) {
+  grid_sf    <- if (area == "NY") grid_ny else grid_ut
+  area_runs  <- grep(paste0("^", area), names(all_results), value = TRUE)
+
+  all_mr <- rbindlist(lapply(area_runs, function(r)
+    all_results[[r]]$spatial[, .(grid_id, mob_RR_model, wave = r)]))
+  log_mr <- log(all_mr$mob_RR_model)
+  log_mr <- log_mr[is.finite(log_mr)]
+  lim    <- quantile(abs(log_mr), 0.99, na.rm = TRUE)
+
+  map_list <- lapply(area_runs, function(run) {
+    sp <- all_results[[run]]$spatial
+    g  <- merge(grid_sf, sp, by = "grid_id", all.x = FALSE)
+    g$log_mob_RR <- pmin(pmax(log(g$mob_RR_model), -lim), lim)
+
+    ggplot(g) +
+      geom_sf(aes(fill = log_mob_RR), color = NA) +
+      scale_fill_distiller(
+        palette = "RdBu", direction = -1,
+        limits = c(-lim, lim),
+        name = expression(log(hat(mu)[mob] / hat(mu)[base]))
+      ) +
+      ggtitle(WAVE_LABS[run]) + THEME_MAP
+  })
+
+  combined <- wrap_plots(map_list, ncol = 3) +
+    plot_annotation(
+      title = paste0(ifelse(area == "NY", "NYC", "Utah"),
+                     " \u2014 Mobility Model Uplift: log(ST_IV / Base)"),
+      theme = theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 13))
+    )
+
+  w <- if (area == "NY") 14 else 16
+  h <- if (area == "NY") 5.5 else 5
+  ggsave(file.path(PCATM_DIR, paste0("pcatm_model_comparison_", area, ".png")),
+         combined, width = w, height = h, dpi = DPI)
+  print(combined)
+}
+```

@@ -1,0 +1,102 @@
+---
+title: "05 - Temporal Intensity μ₀(t)"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+---
+
+## Temporal Intensity μ₀(t)
+
+Compute the temporal baseline μ₀(t): the wave-level smoothed reporting-rate
+baseline, centred to mean = 1 for downstream offsets.
+
+```{r setup, include=FALSE}
+source(here::here("helpers/_utils.R"))
+load_pipeline()
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE,
+  fig.width = 12, fig.height = 8
+)
+
+library(data.table)
+library(zoo)
+```
+
+## Compute μ₀(t)
+
+```{r process_temporal}
+process_temporal <- function(wave_id, wave_months) {
+  out_dir <- get_wave_dir(state, wave_id)
+
+  ## Case rates and 7-day centred smooth baseline (wave-level)
+  cases <- fread(file.path(out_dir, "tables", "case_rates.csv"))
+  mu0 <- cases[, .(mu0_raw = mean(case_rate_spillover, na.rm = TRUE)), by = date]
+  mu0[, date := as.Date(date)]
+  setorder(mu0, date)
+
+  mu0[, mu0_smooth := zoo::rollmean(mu0_raw, k = 7, fill = NA, align = "center")]
+  # Boundary-fill the ends so the smoothed series covers the full wave.
+  mu0[, mu0_smooth := zoo::na.locf(zoo::na.locf(mu0_smooth, na.rm = FALSE), fromLast = TRUE, na.rm = FALSE)]
+
+  # Centre to mean = 1 and floor to avoid log(0) in downstream code.
+  mu0_mean  <- mean(mu0$mu0_smooth, na.rm = TRUE)
+  mu0[, mu0_centered := mu0_smooth / mu0_mean]
+  floor_val <- max(quantile(mu0$mu0_centered, 0.05, na.rm = TRUE), 1e-3)
+  mu0[, mu0 := pmax(mu0_centered, floor_val)]
+  mu0[, sim_day := as.integer(date - min(date)) + 1L]
+
+  fwrite(mu0[, .(date, sim_day, mu0_raw, mu0_smooth, mu0)],
+         file.path(out_dir, "tables", "mu0.csv"))
+
+  ## Temporal covariates (weekend indicator + mobility stats)
+  # total_visits and median_dwell are left on raw scales; later stages standardise.
+  daily_path <- file.path(out_dir, "intermediate", "daily_stats.csv")
+  daily <- fread(daily_path)
+  daily[, date := as.Date(date)]
+  ## daily_stats also carries its own sim_day / is_weekend (from 03); drop them
+  ## so the authoritative versions from mu0 survive the merge.
+  drop_cols <- intersect(c("sim_day", "is_weekend", "source_month"), names(daily))
+  if (length(drop_cols)) daily[, (drop_cols) := NULL]
+
+  covs <- merge(mu0, daily, by = "date", all.x = TRUE)
+  covs[, is_weekend := as.integer(weekdays(date) %in% c("Saturday", "Sunday"))]
+
+  out_cols <- c("date", "sim_day", "mu0", "total_visits", "median_dwell", "is_weekend")
+  fwrite(covs[, ..out_cols], file.path(out_dir, "tables", "temporal_covariates.csv"))
+
+  mu0
+}
+
+run_waves_by_state(process_temporal)
+```
+
+## Plot μ₀(t) Across Waves
+
+```{r plot_mu0, fig.width=10, fig.height=4}
+library(ggplot2)
+for (state in unique(WAVE_RUNS$state)) {
+  .this_state <- state
+  st_waves <- WAVE_RUNS[which(WAVE_RUNS$state == .this_state), ]
+  plot_data <- rbindlist(lapply(seq_len(nrow(st_waves)), function(i) {
+    out_dir <- get_wave_dir(state, st_waves$wave_id[i])
+    dt <- fread(file.path(out_dir, "tables", "mu0.csv"))
+    dt[, period := st_waves$wave_id[i]]
+    dt
+  }))
+  plot_data[, date := as.Date(date)]
+  print(ggplot(plot_data, aes(date)) +
+    geom_line(aes(y = mu0_raw / mean(mu0_smooth, na.rm = TRUE)),
+              color = "grey70", linewidth = 0.3) +
+    geom_line(aes(y = mu0), color = "steelblue", linewidth = 0.8) +
+    geom_hline(yintercept = 1, linetype = "dashed", alpha = 0.5) +
+    facet_wrap(~period, scales = "free_x") +
+    labs(title = paste(state, "— Temporal Intensity μ₀(t)"),
+         subtitle = "Grey = raw daily mean (centered); blue = 7-day smoothed baseline",
+         x = "Date", y = "μ₀(t) (mean = 1)") +
+    theme_ts())
+}
+```

@@ -1,0 +1,480 @@
+---
+title: "07b - Demographics"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+source(here::here("helpers/_utils.R"))
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE,
+  fig.width = 12, fig.height = 8
+)
+```
+
+# Overview
+
+Process demographic covariates: age, employment, building density, and land-use dummies.
+
+```{r init}
+library(data.table); library(sf)
+library(ggplot2); library(viridis); library(patchwork); library(ggspatial)
+load_pipeline()
+
+states <- unique(WAVE_RUNS$state)
+spatial_data <- load_spatial(states)
+```
+
+# Age Demographics (ACS S0101)
+
+```{r age}
+process_age_data <- function(filepath) {
+  dt <- fread(filepath, header = TRUE)
+  dt <- dt[grepl("^[0-9]+US", GEO_ID)]
+
+  result <- data.table(
+    tract_geoid = sub(".*US", "", dt$GEO_ID),
+    total_pop   = as.numeric(dt$S0101_C01_001E),
+    pop_65plus  = as.numeric(dt$S0101_C01_030E),
+    pop_u18     = as.numeric(dt$S0101_C01_022E))
+  result[, pct_older   := pop_65plus / pmax(total_pop, 1)]
+  result[, pct_younger := pop_u18 / pmax(total_pop, 1)]
+  result <- result[nchar(tract_geoid) == 11]
+  result[total_pop < 10, c("pct_older", "pct_younger") := NA_real_]
+  result
+}
+
+age_data <- lapply(CONFIG$age_pop_paths, process_age_data)
+```
+
+# Employment (ACS DP03)
+
+```{r employment}
+process_employment_data <- function(filepath) {
+  dt <- fread(filepath, header = TRUE)
+  dt <- dt[grepl("^[0-9]+US", GEO_ID)]
+
+  result <- data.table(tract_geoid = sub(".*US", "", dt$GEO_ID))
+  result$pop_16plus     <- as.numeric(dt$DP03_0001E)
+  clf                   <- as.numeric(dt$DP03_0003E)
+  result$pct_employed   <- as.numeric(dt$DP03_0004E) / pmax(result$pop_16plus, 1)
+  result$pct_unemployed <- as.numeric(dt$DP03_0005E) / pmax(clf, 1)
+  result <- result[nchar(tract_geoid) == 11]
+  result[pop_16plus < 10, c("pct_employed", "pct_unemployed") := NA_real_]
+  result
+}
+
+empl_data <- lapply(CONFIG$income_empl_paths, process_employment_data)
+```
+
+## Building Density
+
+```{r buildings}
+# Compute grid building-density metrics. For NY use PLUTO parcel intersections;
+# for UT use footprint-centroid counts. Units: units per hectare and m^2 per ha.
+SF_TO_M2 <- 0.092903   # 1 sq ft = 0.092903 m^2
+
+process_buildings_pluto <- function(grid_sf) {
+  pluto_path <- here::here("data/landuse/nyc_mappluto_25v4_shp/MapPLUTO.shp")
+  pluto <- st_read(pluto_path, quiet = TRUE) |>
+    st_transform(st_crs(grid_sf)) |>
+    st_make_valid()
+
+  # Coerce numerics (DBF can read these as character / integer)
+  for (cc in c("UnitsRes", "ResArea", "BldgArea")) {
+    if (cc %in% names(pluto)) pluto[[cc]] <- as.numeric(pluto[[cc]])
+    else                      pluto[[cc]] <- 0
+  }
+  pluto$UnitsRes[is.na(pluto$UnitsRes)] <- 0
+  pluto$ResArea [is.na(pluto$ResArea )] <- 0
+  pluto$BldgArea[is.na(pluto$BldgArea)] <- 0
+
+  # Drop empty parcels to keep the intersection cheap
+  pluto <- pluto[(pluto$UnitsRes + pluto$ResArea + pluto$BldgArea) > 0, ]
+  pluto$parcel_area_m2 <- as.numeric(st_area(pluto))
+  pluto <- pluto[pluto$parcel_area_m2 > 0, ]
+
+  # Snap tiny coordinate differences to avoid GEOS topology errors, then
+  # intersect parcels with grid cells; keep polygon overlaps only.
+  grid_snap  <- st_set_precision(grid_sf,  1e3)   # 1/1000 m = 1 mm
+  pluto_snap <- st_set_precision(pluto,    1e3)
+  inter <- suppressWarnings(
+    st_intersection(grid_snap[, "grid_id"], pluto_snap[, c("UnitsRes", "ResArea", "BldgArea", "parcel_area_m2")])
+  )
+  inter <- suppressWarnings(st_collection_extract(inter, "POLYGON"))
+  inter <- inter[!st_is_empty(inter), ]
+  inter$frac <- as.numeric(st_area(inter)) / inter$parcel_area_m2
+  inter_dt <- as.data.table(st_drop_geometry(inter))
+
+  agg <- inter_dt[, .(
+    units_res     = sum(UnitsRes * frac, na.rm = TRUE),
+    res_floor_m2  = sum(ResArea  * frac, na.rm = TRUE) * SF_TO_M2,
+    bldg_floor_m2 = sum(BldgArea * frac, na.rm = TRUE) * SF_TO_M2
+  ), by = grid_id]
+
+  area_dt <- data.table(grid_id = grid_sf$grid_id,
+                        area_ha = as.numeric(st_area(grid_sf)) / 10000)
+  out <- merge(area_dt, agg, by = "grid_id", all.x = TRUE)
+  for (cc in c("units_res", "res_floor_m2", "bldg_floor_m2"))
+    out[is.na(get(cc)), (cc) := 0]
+
+  out[, building_density   := units_res     / area_ha]   # UnitsRes per hectare
+  out[, res_floor_density  := res_floor_m2  / area_ha]   # m^2 per hectare
+  out[, bldg_floor_density := bldg_floor_m2 / area_ha]
+  out[, .(grid_id, building_density, res_floor_density, bldg_floor_density)]
+}
+
+process_buildings_footprints <- function(state, grid_sf) {
+  # UT: keep footprint-centroid count per hectare (no PLUTO available).
+  buildings <- st_read(get_buildings_path(state), quiet = TRUE) |>
+    st_transform(st_crs(grid_sf))
+  centroids <- suppressWarnings(st_centroid(buildings))
+  hits   <- st_intersects(grid_sf, centroids)
+  counts <- data.table(grid_id = grid_sf$grid_id, n_buildings = lengths(hits))
+
+  grid_areas <- as.numeric(st_area(grid_sf))
+  area_dt <- data.table(grid_id = grid_sf$grid_id, area_sqm = grid_areas)
+  counts <- merge(counts, area_dt, by = "grid_id", all.x = TRUE)
+  counts[, building_density   := n_buildings / (area_sqm / 10000)]
+  counts[, res_floor_density  := NA_real_]   # not available for UT
+  counts[, bldg_floor_density := NA_real_]
+  counts[, c("n_buildings", "area_sqm") := NULL]
+  counts
+}
+
+process_buildings <- function(state, grid_sf) {
+  if (state == "NY") process_buildings_pluto(grid_sf)
+  else               process_buildings_footprints(state, grid_sf)
+}
+
+building_data <- list()
+for (state in states) {
+  building_data[[state]] <- process_buildings(state, spatial_data[[state]]$grid_sf)
+}
+```
+
+## Land Use (classification)
+
+```{r landuse}
+# Robust LIR PROP_CLASS -> standard category. Order matters: industrial
+# before residential (some counties code "I/R" combos), agricultural before
+# vacant, etc. Returns one of:
+#   residential | commercial | industrial | mixed | agricultural | vacant
+#   | exempt    | other
+classify_lir_prop_class <- function(x) {
+  s <- toupper(trimws(as.character(x)))
+  cat <- rep("other", length(s))
+
+  # mixed first (string contains)
+  cat[grepl("MIXED", s)] <- "mixed"
+
+  # industrial: stand-alone "I", or contains INDUSTRIAL
+  is_ind <- (s == "I") | grepl("INDUSTRIAL", s)
+  cat[is_ind & cat == "other"] <- "industrial"
+
+  # commercial: "C" alone, COMMERCIAL, RETAIL, OFFICE
+  is_com <- (s == "C") | grepl("COMMERCIAL|RETAIL|OFFICE", s)
+  cat[is_com & cat == "other"] <- "commercial"
+
+  # residential: lots of variants
+  is_res <- (s == "R") | s %in% c("MH","PUD","CONDO") |
+            grepl("RESIDENT|SINGLE FAMILY|SNGL FAM|MULTI[- ]?FAM|APARTM|TOWNHOUSE|MOBILE HOME|CONDO|PUD|^111|^115|^116|^119|^BR0|^LR0|^RES", s)
+  cat[is_res & cat == "other"] <- "residential"
+
+  # agricultural / forestry / open
+  is_ag <- grepl("AGRICULT|GREENBELT|FAA|FARM|GRAZ", s)
+  cat[is_ag & cat == "other"] <- "agricultural"
+
+  # vacant / undeveloped
+  is_vac <- grepl("VACANT|UNDEVELOP|^LAND$|LAND VACANT|LAND RES|LAND COM", s)
+  cat[is_vac & cat == "other"] <- "vacant"
+
+  # exempt / public
+  is_ex <- grepl("EXEMPT|TAX EXEMPT|GOVERN|RECREATION|RELIGIOUS|CHARITABLE", s)
+  cat[is_ex & cat == "other"] <- "exempt"
+
+  cat[is.na(s) | s == "" | s == "DEFAULT" | s == "UNKNOWN"] <- "other"
+  cat
+}
+
+process_landuse <- function(state, grid_sf, cbg_utm = NULL, year = NULL) {
+  if (state == "NY") {
+    # NYC: spatial join with MapPLUTO shapefile
+    landuse <- st_read(get_landuse_path(state), quiet = TRUE) |>
+      st_transform(st_crs(grid_sf))
+
+    lu_col <- grep("LandUse|landuse|LANDUSE", names(landuse), value = TRUE)[1]
+    grid_centroids <- suppressWarnings(st_centroid(grid_sf))
+    grid_lu <- st_join(grid_centroids, landuse[, lu_col], left = TRUE)
+
+    result <- data.table(grid_id = grid_lu$grid_id, landuse = grid_lu[[lu_col]])
+    result[, landuse_cat := fcase(
+      landuse %in% c("01", "02", "03"), "residential",
+      landuse %in% c("04", "05"), "commercial",
+      landuse %in% c("06", "07"), "industrial",
+      landuse %in% c("08", "09"), "mixed",
+      landuse == "10", "public",
+      landuse == "11", "vacant",
+      default = "other")]
+    return(result[, .(grid_id, landuse, landuse_cat)])
+  }
+
+  # ---- Utah: parcel polygons (LIR) -> dominant developed class per county-grid
+  parcels <- st_read(get_landuse_path(state, year = year), quiet = TRUE) |>
+    st_transform(st_crs(grid_sf))
+  pdt <- as.data.table(st_drop_geometry(parcels))
+  pdt[, landuse_cat := classify_lir_prop_class(PROP_CLASS)]
+  pdt[, acres := suppressWarnings(as.numeric(PARCEL_ACRES))]
+  pdt[is.na(acres) | acres < 0, acres := 0]
+
+  # Spatial: parcel centroid -> grid_id
+  pcent <- suppressWarnings(st_centroid(parcels))
+  joined <- st_join(pcent[, c()], grid_sf[, "grid_id"],
+                    join = st_within, left = TRUE)
+  pdt[, grid_id := joined$grid_id]
+  pdt <- pdt[!is.na(grid_id)]
+
+  agg <- pdt[, .(acres = sum(acres, na.rm = TRUE)),
+             by = .(grid_id, landuse_cat)]
+  dev <- agg[landuse_cat %in% c("residential","commercial","industrial","mixed")]
+  dom <- dev[dev[, .I[which.max(acres)], by = grid_id]$V1,
+             .(grid_id, landuse_cat)]
+
+  # Pick most-common raw PROP_CLASS within the dominant category per grid
+  raw <- pdt[!is.na(PROP_CLASS),
+             .(n = .N), by = .(grid_id, landuse_cat, PROP_CLASS)]
+  raw <- merge(raw, dom, by = c("grid_id","landuse_cat"))
+  raw <- raw[raw[, .I[which.max(n)], by = grid_id]$V1,
+             .(grid_id, landuse = PROP_CLASS)]
+
+  result <- as.data.table(st_drop_geometry(grid_sf))[, .(grid_id)]
+  result <- merge(result, dom, by = "grid_id", all.x = TRUE)
+  result <- merge(result, raw, by = "grid_id", all.x = TRUE)
+  result[is.na(landuse_cat), landuse_cat := "other"]
+  result[is.na(landuse), landuse := "Unknown"]
+  result[, .(grid_id, landuse, landuse_cat)]
+}
+```
+
+## Merge to Grid
+
+```{r merge}
+demo_summary <- list()
+landuse_cache <- list()  # keyed "<state>_<year>"; NY same across years, UT per year
+get_landuse <- function(state, year, grid_sf, cbg_utm) {
+  key <- if (state == "NY") "NY" else paste0("UT_", year)
+  if (is.null(landuse_cache[[key]])) {
+    landuse_cache[[key]] <<- process_landuse(state, grid_sf, cbg_utm, year = year)
+    cat(sprintf("[landuse %s] cats: %s\n", key,
+        paste(landuse_cache[[key]][, .N, by = landuse_cat][order(-N), paste0(landuse_cat, "=", N)],
+              collapse = ", ")))
+  }
+  landuse_cache[[key]]
+}
+for (state in states) {
+  .this_state <- state
+  st_waves <- WAVE_RUNS[which(WAVE_RUNS$state == .this_state), ]
+  grid_sf <- spatial_data[[state]]$grid_sf
+  grid_dt <- as.data.table(st_drop_geometry(grid_sf))
+
+  # NY: cbg_geoid -> tract_geoid. UT: county-level (no tract).
+  if (state == "UT") {
+    grid_dt[, tract_geoid := NA_character_]
+  } else {
+    grid_dt[, tract_geoid := substr(as.character(cbg_geoid), 1, 11)]
+  }
+
+  for (i in seq_len(nrow(st_waves))) {
+    wave_id <- st_waves$wave_id[i]
+    year <- as.character(st_waves$acs_year[i])
+    demo_dt <- copy(grid_dt[, .(grid_id, fips_5, tract_geoid)])
+
+    if (state == "UT") {
+      age_tracts <- copy(age_data[[year]])[, county_fips5 := substr(tract_geoid, 1, 5)]
+      empl_tracts <- copy(empl_data[[year]])[, county_fips5 := substr(tract_geoid, 1, 5)]
+      county_age <- age_tracts[, .(
+        pct_older   = weighted.mean(pct_older,   total_pop, na.rm = TRUE),
+        pct_younger = weighted.mean(pct_younger, total_pop, na.rm = TRUE)
+      ), by = county_fips5]
+      county_empl <- empl_tracts[, .(
+        pct_employed   = weighted.mean(pct_employed,   pop_16plus, na.rm = TRUE),
+        pct_unemployed = weighted.mean(pct_unemployed, pop_16plus, na.rm = TRUE)
+      ), by = county_fips5]
+      demo_dt <- merge(demo_dt, county_age,  by.x = "fips_5", by.y = "county_fips5", all.x = TRUE)
+      demo_dt <- merge(demo_dt, county_empl, by.x = "fips_5", by.y = "county_fips5", all.x = TRUE)
+    } else {
+      demo_dt <- merge(demo_dt, age_data[[year]][,  .(tract_geoid, pct_older, pct_younger)],
+                       by = "tract_geoid", all.x = TRUE)
+      demo_dt <- merge(demo_dt, empl_data[[year]][, .(tract_geoid, pct_employed, pct_unemployed)],
+                       by = "tract_geoid", all.x = TRUE)
+    }
+
+    # Buildings
+    bld_cols <- intersect(c("grid_id", "building_density",
+                            "res_floor_density", "bldg_floor_density"),
+                          names(building_data[[state]]))
+    demo_dt <- merge(demo_dt, building_data[[state]][, ..bld_cols],
+                     by = "grid_id", all.x = TRUE)
+
+    # Land use (raw + category, mirroring NYC pattern)
+    lu_dt <- get_landuse(state, year, grid_sf, spatial_data[[state]]$cbg_utm)
+    demo_dt <- merge(demo_dt, lu_dt[, .(grid_id, landuse, landuse_cat)],
+                     by = "grid_id", all.x = TRUE)
+
+    # Impute NAs with median
+    num_cols <- c("pct_older", "pct_younger", "pct_employed", "pct_unemployed",
+                  "building_density", "res_floor_density", "bldg_floor_density")
+    for (col in intersect(num_cols, names(demo_dt))) {
+      med <- median(demo_dt[[col]], na.rm = TRUE)
+      demo_dt[is.na(get(col)), (col) := fifelse(!is.na(med), med, 0)]
+    }
+    demo_dt[is.na(landuse_cat), landuse_cat := "other"]
+
+    # Dummy variables (mixed dropped — unused downstream; baseline = other/public/vacant)
+    demo_dt[, landuse_residential := as.integer(landuse_cat == "residential")]
+    demo_dt[, landuse_commercial  := as.integer(landuse_cat == "commercial")]
+    demo_dt[, landuse_industrial  := as.integer(landuse_cat == "industrial")]
+
+    # Save once per wave
+    out_dir <- get_wave_dir(state, wave_id)
+    fwrite(demo_dt, file.path(out_dir, "tables", "demographics.csv"))
+
+    demo_summary[[length(demo_summary) + 1L]] <- data.table(
+      state = state, wave_id = wave_id, acs_year = year,
+      n_grids = nrow(demo_dt),
+      pct_older_med    = round(median(demo_dt$pct_older,    na.rm = TRUE), 3),
+      pct_younger_med  = round(median(demo_dt$pct_younger,  na.rm = TRUE), 3),
+      pct_unempl_med   = round(median(demo_dt$pct_unemployed, na.rm = TRUE), 3),
+      bldg_dens_med    = round(median(demo_dt$building_density, na.rm = TRUE), 2),
+      n_landuse_other  = sum(demo_dt$landuse_cat == "other"))
+  }
+}
+demo_summary <- rbindlist(demo_summary, fill = TRUE)
+fwrite(demo_summary, file.path(CONFIG$output_dir, "demographics_summary.csv"))
+print(demo_summary)
+```
+
+## Demographic Maps
+
+```{r demo_maps, fig.width=14, fig.height=10}
+for (state in states) {
+  cbg_utm <- spatial_data[[state]]$cbg_utm
+  grid_sf <- spatial_data[[state]]$grid_sf
+  .this_state <- state
+  st_waves <- WAVE_RUNS[which(WAVE_RUNS$state == .this_state), ]
+
+  for (wid in st_waves$wave_id) {
+    demo <- fread(file.path(get_wave_dir(state, wid), "tables", "demographics.csv"))
+    demo[, fips_5 := NULL]
+    gf <- merge(grid_sf[, c("grid_id", "fips_5")], demo, by = "grid_id", all.x = TRUE)
+
+  if (state == "UT") {
+    cf1 <- ut_county_agg_sf(gf, "pct_older",      fun = mean)
+    cf2 <- ut_county_agg_sf(gf, "pct_younger",    fun = mean)
+    cf3 <- ut_county_agg_sf(gf, "pct_unemployed", fun = mean)
+    gf$bldg_dens <- gf$building_density
+    cf4 <- ut_county_agg_sf(gf, "bldg_dens",      fun = mean)
+    p1 <- ggplot() + cbg_base_layer(cbg_utm, state = state) +
+      geom_sf(data = cf1, aes(fill = pct_older), color = "grey40", linewidth = 0.4) +
+      scale_fill_viridis_c(option = "plasma", name = "% 65+") +
+      map_extras() + labs(title = paste(wid, "- Pct Older (county mean)")) + theme_map()
+    p2 <- ggplot() + cbg_base_layer(cbg_utm, state = state) +
+      geom_sf(data = cf2, aes(fill = pct_younger), color = "grey40", linewidth = 0.4) +
+      scale_fill_viridis_c(option = "viridis", name = "% <18") +
+      map_extras() + labs(title = paste(wid, "- Pct Younger (county mean)")) + theme_map()
+    p3 <- ggplot() + cbg_base_layer(cbg_utm, state = state) +
+      geom_sf(data = cf3, aes(fill = pct_unemployed), color = "grey40", linewidth = 0.4) +
+      scale_fill_viridis_c(option = "inferno", name = "% Unempl") +
+      map_extras() + labs(title = paste(wid, "- Pct Unemployed (county mean)")) + theme_map()
+    p4 <- ggplot() + cbg_base_layer(cbg_utm, state = state) +
+      geom_sf(data = cf4, aes(fill = bldg_dens), color = "grey40", linewidth = 0.4) +
+      scale_fill_viridis_c(option = "magma", name = "Footprints/ha") +
+      map_extras() + labs(title = paste(wid, "- Building Density (county mean)")) + theme_map()
+  } else {
+    cbg_border <- geom_sf(data = cbg_utm, fill = NA, color = "grey60",
+                          linewidth = 0.15, inherit.aes = FALSE)
+    map_theme <- theme_map() + theme(panel.grid = element_blank())
+    p1 <- ggplot() +
+      geom_sf(data = gf, aes(fill = pct_older), color = NA) + cbg_border +
+      scale_fill_viridis_c(option = "plasma", name = "% 65+") +
+      map_extras() + labs(title = paste(wid, "- Pct Older (65+)")) + map_theme
+    p2 <- ggplot() +
+      geom_sf(data = gf, aes(fill = pct_younger), color = NA) + cbg_border +
+      scale_fill_viridis_c(option = "viridis", name = "% <18") +
+      map_extras() + labs(title = paste(wid, "- Pct Younger (<18)")) + map_theme
+    p3 <- ggplot() +
+      geom_sf(data = gf, aes(fill = pct_unemployed), color = NA) + cbg_border +
+      scale_fill_viridis_c(option = "inferno", name = "% Unempl") +
+      map_extras() + labs(title = paste(wid, "- Pct Unemployed")) + map_theme
+    p4 <- ggplot() +
+      geom_sf(data = gf, aes(fill = building_density), color = NA) + cbg_border +
+      scale_fill_viridis_c(option = "magma", name = "Units/ha") +
+      map_extras() + labs(title = paste(wid, "- Residential Density (UnitsRes)")) + map_theme
+  }
+  print((p1 + p2) / (p3 + p4))
+  }
+}
+```
+
+## Land Use
+
+```{r landuse_bldg_maps, fig.width=14, fig.height=14}
+for (state in states) {
+  cbg_utm <- spatial_data[[state]]$cbg_utm
+  grid_sf <- spatial_data[[state]]$grid_sf
+  .this_state <- state
+  st_waves <- WAVE_RUNS[which(WAVE_RUNS$state == .this_state), ]
+  wid1 <- st_waves$wave_id[1]
+  demo <- fread(file.path(get_wave_dir(state, wid1), "tables", "demographics.csv"))
+  demo[, fips_5 := NULL]
+  gf <- merge(grid_sf[, c("grid_id", "fips_5")], demo, by = "grid_id", all.x = TRUE)
+  active <- gf[!is.na(gf$landuse_cat), ]
+
+  if (state == "UT") {
+    cat_colors <- c(residential = "#66c2a5", commercial = "#fc8d62",
+                    industrial = "#8da0cb", mixed = "#e78ac3",
+                    public = "#a6d854", agricultural = "#ffd92f",
+                    vacant = "#e5c494", other = "#b3b3b3")
+
+    gdt <- as.data.table(st_drop_geometry(active))
+    dom <- gdt[, .N, by = .(fips_5, landuse_cat)]
+    dom <- dom[dom[, .I[which.max(N)], by = fips_5]$V1]
+    county_dom <- merge(cbg_utm, dom[, .(fips_5, landuse_cat)],
+                        by.x = "GEOID10", by.y = "fips_5", all.x = TRUE)
+    p_map <- ggplot() + cbg_base_layer(cbg_utm, state = state) +
+      geom_sf(data = county_dom, aes(fill = landuse_cat), color = "grey40", linewidth = 0.4) +
+      scale_fill_manual(values = cat_colors, name = "Land Use") +
+      map_extras() + labs(title = paste(state, "— Dominant Land Use by County")) + theme_map()
+    print(p_map)
+
+    lu_raw <- gdt[, .N, by = .(fips_5, landuse)]
+    lu_raw[, pct := N / sum(N), by = fips_5]
+    lu_raw <- merge(lu_raw, data.table(GEOID10 = cbg_utm$GEOID10,
+      county_name = cbg_utm$NAME10), by.x = "fips_5", by.y = "GEOID10", all.x = TRUE)
+    p_bar <- ggplot(lu_raw, aes(x = reorder(county_name, -pct), y = pct, fill = landuse)) +
+      geom_col(position = "stack") +
+      scale_fill_viridis_d(option = "turbo", name = "Property Class") +
+      scale_y_continuous(labels = scales::percent) +
+      labs(x = NULL, y = "Proportion of grid cells",
+           title = paste(state, "— Property Class Composition by County (raw)")) +
+      coord_flip() + theme_minimal(base_size = 11) +
+      theme(legend.position = "bottom", panel.grid.minor = element_blank()) +
+      guides(fill = guide_legend(ncol = 4, override.aes = list(size = 3)))
+    print(p_bar)
+  } else {
+    cbg_border <- geom_sf(data = cbg_utm, fill = NA, color = "grey60",
+                          linewidth = 0.15, inherit.aes = FALSE)
+    p1 <- ggplot() +
+      geom_sf(data = active, aes(fill = landuse_cat), color = NA) + cbg_border +
+      scale_fill_brewer(palette = "Set2", name = "Land Use") +
+      map_extras() + labs(title = paste(state, "— Land Use Categories")) +
+      theme_map() + theme(panel.grid = element_blank())
+    print(p1)
+  }
+}
+```

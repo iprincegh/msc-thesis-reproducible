@@ -1,0 +1,1020 @@
+---
+title: "10b — Visualization & Validation (Utah)"
+subtitle: "Post-model diagnostics, predictions, and summary figures"
+output: html_document
+---
+
+<!--
+UT-specific visualization and validation. Loads saved outputs from 09b.
+Shared helpers (safe_save, load_month, etc.) live in _utils.R.
+Data is at county×day level (29 counties, raw daily case counts).
+
+── FIGURE INVENTORY ────────────────────────────────────────────────
+  Model fit summary table — WAIC/DIC/pD/RMSE/MAE/R² (per model, county×day)
+  Fixed effects forest plot — covariate RR with CIs
+  Spatial random effect map (BYM2, county-level, phi reported)
+  Temporal random effect wave (line + CI ribbon)
+  Temporal RR on exponentiated scale
+  Spatiotemporal interaction (heatmap + spaghetti + variance, county)
+  Spatiotemporal interaction numeric table (county)
+  Fitted residuals (fitted-vs-residual, scatter, time, histogram, spatial map)
+  Worst-fitting counties — spaghetti + highlight map
+  County-level validation (scatter, temporal counts, choropleth)
+  LISA hotspot — local Moran's I cluster cores (county)
+-->
+
+```{r setup, include=FALSE}
+source(here::here("helpers/_utils.R"))
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE,
+                      fig.width = 12, fig.height = 8)
+```
+
+```{r libraries}
+library(data.table)
+library(sf)
+library(ggplot2)
+library(patchwork)
+library(viridis)
+library(ggspatial)
+library(RColorBrewer)
+library(knitr)
+library(spdep)
+
+load_pipeline()
+ALL_RUNS  <- ALL_RUNS[ALL_RUNS$state == "UT", ]   # change to "NY" for NYC
+WAVE_RUNS <- WAVE_RUNS[WAVE_RUNS$state == "UT", ]  # change to "NY" for NYC
+state <- "UT"
+```
+
+```{r load_data}
+grid_sf0 <- st_read(file.path(CONFIG$grids_dir, sprintf("grid_100m_%s.gpkg", state)), quiet = TRUE)
+months   <- WAVE_RUNS$wave_id
+all_data <- setNames(lapply(months, load_wave, state = state, grid_sf0 = grid_sf0), months)
+
+# Lookup: wave_id → first calendar month (for date arithmetic in temporal plots)
+wave_start_month <- setNames(
+  sapply(seq_len(nrow(WAVE_RUNS)), function(i) WAVE_RUNS$wave_months[[i]][1]),
+  WAVE_RUNS$wave_id)
+
+for (m in months)
+  dir.create(all_data[[m]]$fig_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(CONFIG$output_dir, "figures"), recursive = TRUE, showWarnings = FALSE)
+
+# County polygons — reused across sections
+counties_sf <- st_read(CONFIG$ut_counties_path, quiet = TRUE) |>
+  st_transform(st_crs(grid_sf0))
+counties_sf$COUNTYFP10 <- sprintf("%03d", as.integer(counties_sf$FIPS))
+counties_sf$NAME10     <- counties_sf$NAME
+counties_sf$GEOID10    <- counties_sf$FIPS_STR
+
+# UT: few large polygons — show borders
+poly_color <- "grey40"
+poly_lw    <- 0.4
+```
+
+# Model Fit Summary
+
+WAIC / DIC / pD / RMSE / MAE / R² across all fitted models and periods.
+Metrics are computed at the county×day level (29 counties × ~30 days).
+Lower WAIC and RMSE indicate better fit; higher R² indicates more variance explained.
+
+```{r validation_metrics, results='asis'}
+all_metrics <- rbindlist(lapply(months, function(m) {
+  dt <- copy(all_data[[m]]$comp_09b)
+  dt[, Month := mlabels[m]]
+
+  # Compute per-model RMSE / MAE / R² from each model's own fitted values
+  if (!"RMSE" %in% names(dt)) {
+    d <- all_data[[m]]
+    dt[, `:=`(RMSE = NA_real_, MAE = NA_real_, R2 = NA_real_)]
+    for (i in seq_len(nrow(dt))) {
+      mod_name <- dt$Model[i]
+      mo <- d$res09b$model_outputs[[mod_name]]
+      if (!is.null(mo) && !is.null(mo$fitted_values)) {
+        fv <- as.data.table(mo$fitted_values)
+        y  <- fv$Y; mu <- fv$fitted_mean
+        dt[i, RMSE := round(sqrt(mean((y - mu)^2, na.rm = TRUE)), 4)]
+        dt[i, MAE  := round(mean(abs(y - mu), na.rm = TRUE), 4)]
+        ss_res <- sum((y - mu)^2, na.rm = TRUE)
+        ss_tot <- sum((y - mean(y, na.rm = TRUE))^2, na.rm = TRUE)
+        dt[i, R2 := round(ifelse(ss_tot > 0, 1 - ss_res / ss_tot, NA_real_), 4)]
+      }
+    }
+  }
+  dt
+}), fill = TRUE)
+
+show_cols <- intersect(c("Month", "Model", "DIC", "WAIC", "dWAIC", "pD",
+                         "RMSE", "MAE", "R2", "Correlation"), names(all_metrics))
+tbl <- all_metrics[Status == "OK", ..show_cols]
+num_cols <- intersect(c("DIC", "WAIC", "dWAIC", "pD", "RMSE", "MAE", "R2", "Correlation"), names(tbl))
+for (col in num_cols) tbl[, (col) := round(get(col), 4)]
+
+cat("\n## Model Fit Summary \u2014 county\u00d7day level\n\n")
+print(kable(tbl, format = "pipe", caption = "Model comparison at county\u00d7day level \u2014 WAIC, DIC, pD, RMSE, MAE, R\u00b2 (lower WAIC/RMSE = better)"))
+
+fwrite(all_metrics, file.path(CONFIG$output_dir, "figures",
+                              paste0(state, "_validation_metrics_all.csv")))
+```
+
+# Fixed Effects Forest Plot
+
+Covariate relative risks (RR) with 95% credible intervals.
+RR > 1 indicates a risk-increasing covariate; RR < 1 indicates protective effect.
+Red = statistically significant (95% CI excludes 1); grey = not significant.
+
+```{r fixed_effects, fig.width=10, fig.height=7}
+for (m in months) {
+  d <- all_data[[m]]
+  fe <- d$fixed_09b[covariate != "(Intercept)"]
+  fe[, se := (log(RR_upper) - log(RR)) / qnorm(0.975)]
+  fe[, RR_66lo := exp(log(RR) + qnorm(0.17) * se)]
+  fe[, RR_66hi := exp(log(RR) + qnorm(0.83) * se)]
+  p <- ggplot(fe, aes(x = RR, y = reorder(covariate, RR), color = significant)) +
+    geom_vline(xintercept = 1, linetype = "dashed", color = "grey50") +
+    geom_linerange(aes(xmin = RR_lower, xmax = RR_upper), linewidth = 0.5, alpha = 0.6) +
+    geom_linerange(aes(xmin = RR_66lo, xmax = RR_66hi), linewidth = 1.8) +
+    geom_point(size = 2.5) +
+    scale_color_manual(values = c("TRUE" = "#B2182B", "FALSE" = "#999999"), guide = "none") +
+    labs(title = d$best_model, x = "Relative Risk (exp(beta))", y = NULL) +
+    theme_minimal() +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5),
+          axis.text  = element_text(size = 12),
+          axis.title = element_text(size = 14, face = "bold")) +
+    main_annotation("Fixed Effects", mlabels[m])
+  print(p)
+  safe_save(d$fig_dir, "fixed_effects_RR.png", p, w = 8, h = 7)
+}
+```
+
+# Model Components
+
+Random-effect estimates from the best-fitting model at county×day level.
+These decompose the log relative risk into spatial, temporal, and interaction terms.
+
+## Spatial Random Effect (BYM2)
+
+BYM2 decomposes spatial variation into structured (ICAR) and unstructured (IID) components.
+phi near 1 = mostly spatially structured; phi near 0 = mostly unstructured noise.
+County labels show the posterior mean effect or RR.
+
+```{r z2_spatial_random_effect, fig.width=16, fig.height=12}
+for (m in months) {
+  d  <- all_data[[m]]
+  sp <- as.data.table(d$spatial_09b)
+  n_areas <- nrow(d$grid_sf)
+
+  structured   <- sp[1:n_areas]
+  unstructured <- sp[(n_areas + 1):(2 * n_areas)]
+
+  total_effect <- data.table(
+    grid_id = structured$grid_id,
+    structured_mean = structured$mean,
+    unstructured_mean = unstructured$mean,
+    total_mean = structured$mean + unstructured$mean,
+    total_RR   = exp(structured$mean + unstructured$mean),
+    structured_RR = exp(structured$mean),
+    unstructured_RR = exp(unstructured$mean)
+  )
+  te_sf <- merge(d$grid_sf, total_effect, by = "grid_id", all.x = FALSE)
+
+  p1 <- ggplot(te_sf) +
+    geom_sf(aes(fill = structured_mean), color = "grey40", linewidth = 0.4, alpha = 0.9) +
+    scale_fill_viridis_c(option = "plasma", name = "Effect") +
+    labs(title = "Structured (ICAR)") +
+    theme_minimal() +
+    theme(axis.text = element_blank(), axis.title = element_blank(),
+          axis.ticks = element_blank(), panel.grid = element_blank(),
+          legend.position = "right",
+          plot.title = element_text(face = "bold", hjust = 0.5))
+
+  p2 <- ggplot(te_sf) +
+    geom_sf(aes(fill = unstructured_mean), color = "grey40", linewidth = 0.4, alpha = 0.9) +
+    scale_fill_viridis_c(option = "viridis", name = "Effect") +
+    labs(title = "Unstructured (IID)") +
+    theme_minimal() +
+    theme(axis.text = element_blank(), axis.title = element_blank(),
+          axis.ticks = element_blank(), panel.grid = element_blank(),
+          legend.position = "right",
+          plot.title = element_text(face = "bold", hjust = 0.5))
+
+  p3 <- ggplot(te_sf) +
+    geom_sf(aes(fill = total_mean), color = "grey40", linewidth = 0.4, alpha = 0.9) +
+    scale_fill_viridis_c(option = "magma", name = "Effect") +
+    labs(title = "Total Spatial Effect (log RR)") +
+    theme_minimal() +
+    theme(axis.text = element_blank(), axis.title = element_blank(),
+          axis.ticks = element_blank(), panel.grid = element_blank(),
+          legend.position = "right",
+          plot.title = element_text(face = "bold", hjust = 0.5))
+
+  p4 <- ggplot(te_sf) +
+    geom_sf(aes(fill = total_RR), color = "grey40", linewidth = 0.4, alpha = 0.9) +
+    scale_fill_viridis_c(option = "inferno", name = "RR",
+                         trans = "log", breaks = c(0.5, 1, 2, 4)) +
+    labs(title = "Spatial Relative Risk (RR)") +
+    theme_minimal() +
+    theme(axis.text = element_blank(), axis.title = element_blank(),
+          axis.ticks = element_blank(), panel.grid = element_blank(),
+          legend.position = "right",
+          plot.title = element_text(face = "bold", hjust = 0.5))
+
+  # Add value labels (few counties)
+  cents <- suppressWarnings(st_centroid(te_sf))
+  p3 <- p3 + geom_sf_text(data = cents, aes(label = round(total_mean, 2)),
+                           size = 2.5, fontface = "bold")
+  p4 <- p4 + geom_sf_text(data = cents, aes(label = round(total_RR, 2)),
+                           size = 2.5, fontface = "bold")
+
+  hyper <- as.data.table(d$res09b$model_outputs[[d$best_model]]$hyperparameters)
+  phi_row <- hyper[grepl("Phi", parameter)]
+  phi_val <- if (nrow(phi_row) > 0) round(phi_row$mean, 3) else NA
+  phi_text <- if (!is.na(phi_val)) paste0("  |  BYM2 mixing phi = ", phi_val) else ""
+
+  p <- (p1 + p2) / (p3 + p4) +
+    plot_annotation(
+      title = paste("Spatial Random Effects (BYM2) —", mlabels[m]),
+      subtitle = paste0("Model: ", d$best_model, phi_text),
+      theme = theme(plot.title    = element_text(face = "bold", hjust = 0.5, size = 14),
+                    plot.subtitle = element_text(hjust = 0.5, colour = "grey40")))
+  print(p)
+  safe_save(d$fig_dir, "z2_spatial_random_effects.png", p, w = 16, h = 12)
+}
+```
+
+## Temporal Random Effect
+
+Time-varying baseline risk on the log scale. Positive values indicate
+elevated risk relative to the overall mean; negative values indicate lower-than-average risk.
+
+```{r z3_temporal_random_effect, fig.width=12, fig.height=6}
+for (m in months) {
+  d  <- all_data[[m]]
+  tp <- as.data.table(d$temporal_09b)
+  start <- as.Date(paste0(wave_start_month[m], "-01"))
+  tp[, date := start + idx_temporal - 1L]
+
+  p <- ggplot(tp, aes(x = date, y = mean)) +
+    geom_ribbon(aes(ymin = q025, ymax = q975), fill = "#4393C3", alpha = 0.2) +
+    geom_ribbon(aes(ymin = mean - sd, ymax = mean + sd), fill = "#4393C3", alpha = 0.35) +
+    geom_line(linewidth = 1, color = "#2166AC") +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+    geom_point(size = 1.5, color = "#2166AC") +
+    scale_x_date(date_labels = "%b %d", date_breaks = "5 days") +
+    labs(x = "Date", y = "Effect Size (log scale)",
+         title = paste("Temporal Random Effect —", mlabels[m]),
+         subtitle = paste("Model:", d$best_model,
+                          " |  Bands: +/-1 sigma (dark), 95% CI (light)")) +
+    theme_minimal() +
+    theme(
+      axis.text   = element_text(size = 12),
+      axis.title  = element_text(size = 14, face = "bold"),
+      plot.title  = element_text(face = "bold", hjust = 0.5, size = 14),
+      plot.subtitle = element_text(hjust = 0.5, colour = "grey40"),
+      panel.grid.minor = element_line(color = "grey80", linewidth = 0.3)
+    )
+  print(p)
+  safe_save(d$fig_dir, "z3_temporal_random_effect.png", p, w = 12, h = 6)
+}
+```
+
+## Temporal Relative Risk
+
+Exponentiated temporal effect: RR > 1 means above-average risk on that day;
+RR < 1 means below-average. The shaded band shows the 95% credible interval.
+
+```{r z3b_temporal_rr, fig.width=12, fig.height=6}
+for (m in months) {
+  d  <- all_data[[m]]
+  tp <- as.data.table(d$temporal_09b)
+  start <- as.Date(paste0(wave_start_month[m], "-01"))
+  tp[, date := start + idx_temporal - 1L]
+  tp[, `:=`(rr_lo = exp(q025), rr_hi = exp(q975))]
+
+  p <- ggplot(tp, aes(x = date, y = RR_temporal)) +
+    geom_ribbon(aes(ymin = rr_lo, ymax = rr_hi), fill = "#D6604D", alpha = 0.2) +
+    geom_line(linewidth = 1, color = "#B2182B") +
+    geom_point(size = 1.5, color = "#B2182B") +
+    geom_hline(yintercept = 1, linetype = "dashed", color = "gray50") +
+    scale_x_date(date_labels = "%b %d", date_breaks = "5 days") +
+    labs(x = "Date", y = "Temporal Relative Risk",
+         title = paste("Temporal RR —", mlabels[m]),
+         subtitle = paste("Model:", d$best_model, " |  95% Credible Interval")) +
+    theme_minimal() +
+    theme(
+      axis.text   = element_text(size = 12),
+      axis.title  = element_text(size = 14, face = "bold"),
+      plot.title  = element_text(face = "bold", hjust = 0.5, size = 14),
+      plot.subtitle = element_text(hjust = 0.5, colour = "grey40"),
+      panel.grid.minor = element_line(color = "grey80", linewidth = 0.3)
+    )
+  print(p)
+  safe_save(d$fig_dir, "z3b_temporal_rr.png", p, w = 12, h = 6)
+}
+```
+
+## Spatiotemporal Interaction
+
+Residual space×time deviations: ξ(g,t) = log RR(g,t) − u(g) − γ(t).
+High variance in a county means its epidemic trajectory differs strongly
+from the overall spatial + temporal trend.
+
+```{r z4_compute_delta}
+# Shared delta_gt computation used by both Z4 (plots) and Z4b (table)
+z4_data <- list()
+for (m in months) {
+  d  <- all_data[[m]]
+  ft <- as.data.table(d$fitted_09b)
+  sp <- as.data.table(d$spatial_09b)
+  tp <- as.data.table(d$temporal_09b)
+  n_areas <- nrow(d$grid_sf)
+
+  sp_total <- data.table(
+    grid_id = sp$grid_id[1:n_areas],
+    sp_mean = sp$mean[1:n_areas] + sp$mean[(n_areas + 1):(2 * n_areas)]
+  )
+  tp_dt <- data.table(time_id = tp$idx_temporal, tp_mean = tp$mean)
+
+  ft[, log_RR := log(pmax(RR, 1e-10))]
+  ft <- merge(ft, sp_total, by = "grid_id")
+  ft <- merge(ft, tp_dt,    by = "time_id")
+  ft[, delta_gt := log_RR - sp_mean - tp_mean]
+  ft[, delta_gt := delta_gt - mean(delta_gt, na.rm = TRUE)]
+  ft <- ft[is.finite(delta_gt)]
+
+  grid_n <- ft[, .N, by = grid_id]
+  ft <- ft[grid_id %in% grid_n[N >= 2, grid_id]]
+  z4_data[[m]] <- ft
+}
+```
+
+```{r z4_spatiotemporal_interaction, fig.width=16, fig.height=10}
+for (m in months) {
+  d  <- all_data[[m]]
+  ft <- z4_data[[m]]
+  start <- as.Date(paste0(wave_start_month[m], "-01"))
+
+  # Heatmap
+  st_mat <- ft[, .(st_mean = mean(delta_gt, na.rm = TRUE)), by = .(grid_id, time_id)]
+  st_mat[, date := start + time_id - 1L]
+
+  g_dt <- as.data.table(st_drop_geometry(d$grid_sf))
+  if ("county_name" %in% names(g_dt)) {
+    st_mat <- merge(st_mat, g_dt[, .(grid_id, county_name)], by = "grid_id", all.x = TRUE)
+    st_mat[, spatial_label := county_name]
+  } else {
+    st_mat[, spatial_label := as.character(grid_id)]
+  }
+
+  q_st <- quantile(abs(st_mat$st_mean), 0.99, na.rm = TRUE)
+
+  p_heat <- ggplot(st_mat, aes(x = date, y = reorder(spatial_label, st_mean),
+                                fill = pmin(pmax(st_mean, -q_st), q_st))) +
+    geom_tile() +
+    scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                         midpoint = 0, name = "ST Effect",
+                         limits = c(-q_st, q_st)) +
+    scale_x_date(date_labels = "%b %d", date_breaks = "5 days") +
+    labs(x = "Date", y = "County",
+         title = "A) Spatiotemporal Interaction Heatmap") +
+    theme_minimal() +
+    theme(axis.text.y = element_text(size = 8),
+          axis.text.x = element_text(size = 11),
+          axis.title  = element_text(size = 14, face = "bold"),
+          plot.title  = element_text(face = "bold", hjust = 0.5))
+
+  # Spaghetti plot
+  p_lines <- ggplot(st_mat, aes(x = date, y = st_mean,
+                                 group = spatial_label, color = spatial_label)) +
+    geom_line(alpha = 0.6, linewidth = 0.6) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+    scale_x_date(date_labels = "%b %d", date_breaks = "5 days") +
+    labs(x = "Date", y = "ST Interaction Effect",
+         title = "B) County-specific Temporal Deviations") +
+    theme_minimal() +
+    theme(legend.position = "right",
+          legend.text  = element_text(size = 7),
+          legend.title = element_blank(),
+          axis.text    = element_text(size = 12),
+          axis.title   = element_text(size = 14, face = "bold"),
+          panel.grid.minor = element_line(color = "grey80", linewidth = 0.3),
+          plot.title   = element_text(face = "bold", hjust = 0.5))
+
+  # Variance map
+  var_map_dt <- ft[, .(st_var = var(delta_gt, na.rm = TRUE),
+                        st_range = diff(range(delta_gt, na.rm = TRUE))), by = grid_id]
+  var_sf <- merge(d$grid_sf, var_map_dt, by = "grid_id", all.x = FALSE)
+
+  p_var_map <- ggplot(var_sf) +
+    geom_sf(aes(fill = st_var), color = "grey40", linewidth = 0.4) +
+    scale_fill_viridis_c(option = "rocket", name = "Variance", direction = -1) +
+    labs(title = "C) ST Interaction Variability") +
+    theme_minimal() +
+    theme(axis.text = element_blank(), axis.title = element_blank(),
+          axis.ticks = element_blank(), panel.grid = element_blank(),
+          plot.title = element_text(face = "bold", hjust = 0.5))
+
+  cents <- suppressWarnings(st_centroid(var_sf))
+  p_var_map <- p_var_map +
+    geom_sf_text(data = cents, aes(label = round(st_var, 2)),
+                 size = 2.2, fontface = "bold")
+
+  p <- (p_heat / (p_lines | p_var_map)) +
+    plot_annotation(
+      title = paste("Spatiotemporal Interaction —", mlabels[m]),
+      subtitle = paste("Model:", d$best_model,
+                       " |  \u03b4(g,t) = log RR(g,t) \u2212 u(g) \u2212 \u03b3(t)"),
+      theme = theme(plot.title    = element_text(face = "bold", hjust = 0.5, size = 14),
+                    plot.subtitle = element_text(hjust = 0.5, colour = "grey40")))
+  print(p)
+  safe_save(d$fig_dir, "z4_spatiotemporal_interaction.png", p, w = 16, h = 10)
+}
+```
+
+## Spatiotemporal Interaction — Numeric Table
+
+```{r z4b_st_table, results='asis'}
+for (m in months) {
+  d  <- all_data[[m]]
+  ft <- z4_data[[m]]
+
+  st_summary <- ft[, .(
+    mean_st  = round(mean(delta_gt), 4),
+    sd_st    = round(sd(delta_gt), 4),
+    min_st   = round(min(delta_gt), 4),
+    max_st   = round(max(delta_gt), 4),
+    range_st = round(max(delta_gt) - min(delta_gt), 4)
+  ), by = grid_id]
+
+  g_dt <- as.data.table(st_drop_geometry(d$grid_sf))
+  if ("county_name" %in% names(g_dt))
+    st_summary <- merge(st_summary, g_dt[, .(grid_id, county_name)], by = "grid_id", all.x = TRUE)
+
+  setorder(st_summary, -range_st)
+  cat("\n### ST Interaction Summary \u2014", mlabels[m], "\n\n")
+  print(kable(head(st_summary, 40), format = "pipe", digits = 4,
+              caption = paste("\u03b4(g,t) by county \u2014", mlabels[m])))
+
+  tbl_dir <- file.path(all_data[[m]]$out_dir, "tables")
+  fwrite(st_summary, file.path(tbl_dir, "spatiotemporal_interaction_summary.csv"))
+}
+```
+
+# Model Diagnostics
+
+Residual analysis at the county×day level.
+Residuals (observed − fitted counts) centered on zero with no systematic
+patterns indicate good model fit.
+
+## Fitted Residuals
+
+Raw residuals (Y − Fitted) at the county×day level. A well-calibrated model
+produces residuals evenly scattered around zero with no fan-shaped or temporal trends.
+
+```{r z1_fitted_residuals, fig.width=15, fig.height=12}
+for (m in months) {
+  d  <- all_data[[m]]
+  ft <- as.data.table(d$fitted_09b)
+  ft[, residual := Y - fitted_mean]
+  ft[, obs_idx := .I]
+  start <- as.Date(paste0(wave_start_month[m], "-01"))
+  ft[, date := start + time_id - 1L]
+  label <- d$best_model
+
+  p_fitted <- ggplot(ft, aes(x = fitted_mean, y = residual)) +
+    geom_point(alpha = 0.3, size = 0.4, color = "steelblue") +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "red", linewidth = 0.7) +
+    geom_smooth(se = FALSE, color = "#E64B35", linewidth = 0.8) +
+    labs(x = "Fitted Values", y = "Residual (Y - Fitted)",
+         title = "Fitted vs Residuals") +
+    theme_minimal() +
+    theme(axis.text  = element_text(size = 12),
+          axis.title = element_text(size = 14, face = "bold"),
+          panel.grid.minor = element_line(color = "grey80", linewidth = 0.3),
+          plot.title = element_text(face = "bold", hjust = 0.5))
+
+  p_idx <- ggplot(ft, aes(x = obs_idx, y = residual)) +
+    geom_point(alpha = 0.3, size = 0.4, color = "steelblue") +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "red", linewidth = 0.7) +
+    labs(x = "Observation Index", y = "Residual (Y - Fitted)",
+         title = "Residuals vs Observation Index") +
+    theme_minimal() +
+    theme(axis.text  = element_text(size = 12),
+          axis.title = element_text(size = 14, face = "bold"),
+          panel.grid.minor = element_line(color = "grey80", linewidth = 0.3),
+          plot.title = element_text(face = "bold", hjust = 0.5))
+
+  p_time <- ggplot(ft, aes(x = date, y = residual)) +
+    geom_point(alpha = 0.3, size = 0.3, color = "grey50") +
+    geom_smooth(color = "#E64B35", fill = "#E64B35",
+                alpha = 0.2, linewidth = 0.8) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "red", linewidth = 0.7) +
+    scale_x_date(date_labels = "%b %d", date_breaks = "5 days") +
+    labs(x = "Date", y = "Residual (Y - Fitted)", title = "Residuals over Time") +
+    theme_minimal() +
+    theme(axis.text  = element_text(size = 12),
+          axis.title = element_text(size = 14, face = "bold"),
+          panel.grid.minor = element_line(color = "grey80", linewidth = 0.3),
+          plot.title = element_text(face = "bold", hjust = 0.5))
+
+  p_hist <- ggplot(ft, aes(x = residual)) +
+    geom_histogram(bins = 80, fill = "#4DBBD5", color = "white", linewidth = 0.15) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "red", linewidth = 0.7) +
+    labs(x = "Residual (Y - Fitted)", y = "Count",
+         title = "Residual Distribution") +
+    theme_minimal() +
+    theme(axis.text  = element_text(size = 12),
+          axis.title = element_text(size = 14, face = "bold"),
+          panel.grid.minor = element_line(color = "grey80", linewidth = 0.3),
+          plot.title = element_text(face = "bold", hjust = 0.5))
+
+  resid_spatial <- ft[, .(mean_resid = mean(residual, na.rm = TRUE)), by = grid_id]
+  rsf <- merge(d$grid_sf, resid_spatial, by = "grid_id", all.x = FALSE)
+  q <- quantile(abs(rsf$mean_resid), .99, na.rm = TRUE)
+
+  p_map <- ggplot(rsf) +
+    geom_sf(aes(fill = pmin(pmax(mean_resid, -q), q)),
+            color = "grey40", linewidth = 0.4) +
+    scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                         midpoint = 0, name = "Mean\nResidual", limits = c(-q, q)) +
+    labs(title = "Spatial Residuals") +
+    theme_minimal() +
+    theme(axis.text = element_blank(), axis.title = element_blank(),
+          axis.ticks = element_blank(), panel.grid = element_blank(),
+          plot.title = element_text(face = "bold", hjust = 0.5))
+
+  p <- ((p_fitted | p_idx | p_time) / (p_hist | p_map)) +
+    plot_annotation(
+      title = paste("Fitted Residual Diagnostics —", mlabels[m]),
+      subtitle = paste("Model:", label, " |  county\u00d7day level  |  N =", format(nrow(ft), big.mark = ",")),
+      theme = theme(plot.title    = element_text(face = "bold", hjust = 0.5, size = 14),
+                    plot.subtitle = element_text(hjust = 0.5, colour = "grey40")))
+  print(p)
+  safe_save(d$fig_dir, "z1_fitted_residuals.png", p, w = 15, h = 12)
+}
+```
+
+## Worst-Fitting Counties
+
+Counties with the largest mean absolute residuals over time.
+Spatially clustered worst-fitting counties may indicate missing local covariates.
+
+```{r z1b_worst_fitting, fig.width=14, fig.height=12}
+for (m in months) {
+  d  <- all_data[[m]]
+  ft <- as.data.table(d$fitted_09b)
+  ft[, residual := Y - fitted_mean]
+  start <- as.Date(paste0(wave_start_month[m], "-01"))
+  ft[, date := start + time_id - 1L]
+
+  # County name lookup
+  grid_lkp <- as.data.table(st_drop_geometry(grid_sf0))[, .(grid_id, fips_5)]
+  clkp <- as.data.table(st_drop_geometry(counties_sf))[, .(fips_5 = GEOID10, name = NAME10)]
+  ft <- merge(ft, grid_lkp, by = "grid_id", all.x = TRUE)
+  ft <- merge(ft, clkp, by = "fips_5", all.x = TRUE)
+  ft[is.na(name), name := as.character(grid_id)]
+
+  # Mean absolute residual per county
+  county_mae <- ft[, .(mae = mean(abs(residual), na.rm = TRUE),
+                        mean_resid = mean(residual, na.rm = TRUE)),
+                   by = .(fips_5, name)]
+  setorder(county_mae, -mae)
+  n_worst <- min(15, nrow(county_mae))
+  worst_ids <- county_mae[1:n_worst, fips_5]
+
+  # A) Spaghetti plot -- residual time series for worst counties
+  spaghetti_dt <- ft[fips_5 %in% worst_ids,
+                     .(residual = mean(residual, na.rm = TRUE)),
+                     by = .(name, date)]
+  mean_line <- spaghetti_dt[, .(mean_resid = mean(residual, na.rm = TRUE)), by = date]
+
+  p_spag <- ggplot(spaghetti_dt, aes(x = date, y = residual,
+                                      group = name, color = name)) +
+    geom_line(alpha = 0.7, linewidth = 0.7) +
+    geom_line(data = mean_line, aes(x = date, y = mean_resid),
+              inherit.aes = FALSE, color = "black", linetype = "dashed", linewidth = 0.9) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+    scale_x_date(date_labels = "%b %d", date_breaks = "5 days") +
+    labs(x = "Date", y = "Mean Residual (Y - Fitted)",
+         title = paste0("Residual Time Series -- Top ", n_worst, " Worst-Fitting Counties"),
+         color = "County") +
+    theme_minimal() +
+    theme(legend.position = "right",
+          legend.text  = element_text(size = 8),
+          axis.text  = element_text(size = 12),
+          axis.title = element_text(size = 14, face = "bold"),
+          panel.grid.minor = element_line(color = "grey80", linewidth = 0.3),
+          plot.title = element_text(face = "bold", hjust = 0.5))
+
+  # B) Highlight map -- worst counties in red, others in grey
+  cmap <- merge(counties_sf, county_mae[, .(fips_5, mae)],
+                by.x = "GEOID10", by.y = "fips_5", all.x = TRUE)
+  cmap$is_worst <- ifelse(cmap$GEOID10 %in% worst_ids, "Worst-fitting", "Other")
+
+  p_map <- ggplot() +
+    geom_sf(data = cmap[cmap$is_worst == "Other", ],
+            fill = "grey90", color = "grey40", linewidth = 0.4) +
+    geom_sf(data = cmap[cmap$is_worst == "Worst-fitting", ],
+            fill = "#B2182B", color = "grey40", linewidth = 0.4) +
+    geom_sf_text(data = cmap, aes(label = NAME10), size = 2, fontface = "bold") +
+    map_extras() +
+    labs(title = paste0("Location of Top ", n_worst, " Worst-Fitting Counties"),
+         subtitle = paste("Ranked by mean absolute residual | MAE range:",
+                          round(county_mae[n_worst, mae], 1), "--",
+                          round(county_mae[1, mae], 1))) +
+    theme_minimal() +
+    theme(axis.text = element_blank(), axis.title = element_blank(),
+          axis.ticks = element_blank(), panel.grid = element_blank(),
+          plot.title    = element_text(face = "bold", hjust = 0.5),
+          plot.subtitle = element_text(hjust = 0.5, colour = "grey40"))
+
+  p <- (p_spag / p_map) +
+    plot_annotation(
+      title = paste("Worst-Fitting Counties --", mlabels[m]),
+      subtitle = paste("Model:", d$best_model,
+                       " |  N =", format(nrow(ft), big.mark = ",")),
+      theme = theme(plot.title    = element_text(face = "bold", hjust = 0.5, size = 14),
+                    plot.subtitle = element_text(hjust = 0.5, colour = "grey40")))
+  print(p)
+  safe_save(d$fig_dir, "z1b_worst_fitting_counties.png", p, w = 14, h = 12)
+}
+```
+
+# County-level Validation
+
+Observed vs predicted daily case counts at county×day resolution.
+Points near the 1:1 diagonal indicate accurate predictions.
+Blue residuals = underprediction; red = overprediction; white = accurate.
+
+```{r county_data_prep}
+grid_lkp <- as.data.table(st_drop_geometry(grid_sf0))[, .(grid_id, fips_5)]
+
+agg_results <- list()
+for (m in months) {
+  ft <- as.data.table(all_data[[m]]$fitted_09b)
+  ft <- merge(ft, grid_lkp, by = "grid_id", all.x = TRUE)
+  ft <- ft[!is.na(fips_5)]
+  cp <- ft[, .(obs = sum(Y, na.rm = TRUE), pred = sum(fitted_mean, na.rm = TRUE)),
+           by = fips_5]
+  agg_results[[m]] <- list(county_day = ft, county_period = cp)
+}
+```
+
+```{r county_table, results='asis'}
+county_int_metrics <- list()
+for (m in months) {
+  cd <- agg_results[[m]]$county_day
+  if (is.null(cd) || nrow(cd) < 5) next
+  cp <- agg_results[[m]]$county_period
+  county_int_metrics[[m]] <- data.table(
+    Month      = mlabels[m],
+    N_counties = uniqueN(cd$fips_5),
+    RMSE       = round(sqrt(mean((cd$Y - cd$fitted_mean)^2)), 2),
+    MAE        = round(mean(abs(cd$Y - cd$fitted_mean)), 2),
+    Corr       = round(cor(cd$Y, cd$fitted_mean, use = "complete"), 4),
+    R2         = round(1 - sum((cd$Y - cd$fitted_mean)^2) /
+                          sum((cd$Y - mean(cd$Y))^2), 4),
+    RMSE_total = round(sqrt(mean((cp$obs - cp$pred)^2)), 2),
+    Corr_total = round(cor(cp$obs, cp$pred, use = "complete"), 4)
+  )
+}
+cat("\n### Validation: Observed vs Predicted County-Day Counts\n\n")
+int_dt <- rbindlist(county_int_metrics)
+print(kable(int_dt, format = "pipe",
+            caption = "County-day prediction accuracy (raw counts)"))
+fwrite(int_dt, file.path(CONFIG$output_dir, "figures",
+       paste0(state, "_county_internal_metrics.csv")))
+
+for (key in names(agg_results)) {
+  cp <- agg_results[[key]]$county_period
+  tbl_dir <- file.path(all_data[[key]]$out_dir, "tables")
+  fwrite(cp, file.path(tbl_dir, "county_validation_detail.csv"))
+}
+```
+
+```{r county_scatter, fig.width=14, fig.height=10}
+scatter_list <- list()
+for (m in months) {
+  cd <- agg_results[[m]]$county_day
+  if (is.null(cd) || nrow(cd) < 5) next
+
+  r2  <- 1 - sum((cd$Y - cd$fitted_mean)^2) / sum((cd$Y - mean(cd$Y))^2)
+  rho <- cor(cd$Y, cd$fitted_mean, use = "complete")
+  rmse <- sqrt(mean((cd$Y - cd$fitted_mean)^2))
+
+  scatter_list[[m]] <- ggplot(cd, aes(x = Y, y = fitted_mean)) +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "grey50") +
+    geom_point(alpha = 0.55, color = "#2166AC", size = 2) +
+    geom_smooth(method = "lm", se = TRUE, color = "#B2182B", linewidth = 0.8, alpha = 0.2) +
+    annotate("text", x = Inf, y = -Inf, hjust = 1.1, vjust = -0.5, size = 3.5,
+             label = sprintf("R² = %.3f\nr = %.3f\nRMSE = %.1f", r2, rho, rmse)) +
+    labs(title = mlabels[m],
+         x = "Observed Cases (county-day)",
+         y = "Predicted Cases (county-day)") +
+    theme_minimal() + theme(plot.title = element_text(face = "bold", hjust = 0.5))
+}
+
+if (length(scatter_list) > 0) {
+  p <- wrap_plots(scatter_list, ncol = min(3, length(scatter_list))) +
+    plot_annotation(
+      title = "County-Day Validation: Observed vs Predicted Case Counts",
+      subtitle = paste("Best model:", all_data[[months[1]]]$best_model,
+                       " | 29 counties × 30–31 days"),
+      theme = theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 14),
+                    plot.subtitle = element_text(hjust = 0.5, color = "grey40")))
+  print(p)
+  safe_save(file.path(CONFIG$output_dir, "figures"),
+            paste0(state, "_county_day_scatter.png"), p,
+            w = min(18, 6 * length(scatter_list)),
+            h = ceiling(length(scatter_list) / 3) * 6)
+}
+```
+
+## County Temporal Count Comparison
+
+Observed vs fitted daily case counts for selected counties,
+aggregated from county×day model output.
+Close alignment between solid (fitted) and dashed (observed) lines indicates good temporal tracking.
+
+```{r county_temporal_counts, fig.width=14, fig.height=10}
+milestones_county <- list(
+  "wave1" = data.frame(
+    date  = as.Date(c("2020-04-10", "2020-04-17")),
+    label = c("Stay-home directive easing", "Gradual reopening begins"),
+    stringsAsFactors = FALSE),
+  "wave2" = data.frame(
+    date  = as.Date(c("2021-01-08", "2021-01-20")),
+    label = c("Post-holiday surge peak", "Vaccine rollout expands"),
+    stringsAsFactors = FALSE),
+  "wave3" = data.frame(
+    date  = as.Date(c("2022-01-07", "2022-01-18")),
+    label = c("Omicron peak (SLC metro)", "Rapid decline begins"),
+    stringsAsFactors = FALSE)
+)
+
+n_extreme <- 5
+
+for (m in months) {
+  d     <- all_data[[m]]
+  start <- as.Date(paste0(wave_start_month[m], "-01"))
+
+  cd <- copy(agg_results[[m]]$county_day)
+  if (is.null(cd) || nrow(cd) < 5) next
+
+  clkp <- as.data.table(st_drop_geometry(counties_sf))[, .(fips_5 = GEOID10, name = NAME10)]
+  cd <- merge(cd, clkp, by = "fips_5", all.x = TRUE)
+  cd[is.na(name), name := fips_5]
+  cd[, date := start + time_id - 1L]
+
+  # Aggregate to county-day
+  county_day <- cd[, .(obs = sum(Y, na.rm = TRUE),
+                       pred = sum(fitted_mean, na.rm = TRUE)),
+                   by = .(name, date)]
+
+  # Select top / bottom counties by average observed count
+  avg_count <- county_day[, .(avg = mean(obs, na.rm = TRUE)), by = name]
+  top_ids <- head(avg_count[order(-avg)], n_extreme)$name
+  bot_ids <- head(avg_count[order( avg)], n_extreme)$name
+
+  pd <- county_day[name %in% c(top_ids, bot_ids)]
+  pd[, group := fifelse(name %in% top_ids,
+                        "Highest-count Counties", "Lowest-count Counties")]
+  pd_long <- rbind(
+    pd[, .(name, date, count = obs,  type = "Observed", group)],
+    pd[, .(name, date, count = pred, type = "Fitted",   group)]
+  )
+
+  ms <- milestones_county[[m]]
+
+  p <- ggplot(pd_long, aes(x = date, y = count,
+                            color = name, linetype = type)) +
+    geom_line(linewidth = 0.7, alpha = 0.85) +
+    geom_vline(xintercept = ms$date, linetype = "dotted", colour = "grey40") +
+    geom_text(data = data.frame(date = ms$date, label = ms$label),
+              aes(x = date, y = Inf, label = label),
+              inherit.aes = FALSE, angle = 90, hjust = 1, vjust = -0.4,
+              size = 3, colour = "grey30") +
+    scale_linetype_manual(values = c("Fitted" = "solid", "Observed" = "dashed")) +
+    facet_wrap(~ group, scales = "free_y", ncol = 1) +
+    scale_x_date(date_labels = "%b %d", date_breaks = "5 days") +
+    labs(x = NULL, y = "Daily Case Count",
+         color = "County", linetype = "Type",
+         title = paste("Observed vs Fitted Case Counts --", mlabels[m]),
+         subtitle = paste0("Model: ", d$best_model,
+                           "  |  Top/Bottom ", n_extreme,
+                           " counties by average daily count",
+                           "  |  Solid = fitted, Dashed = observed")) +
+    theme_minimal() +
+    theme(plot.title    = element_text(face = "bold", hjust = 0.5),
+          plot.subtitle = element_text(size = 10, hjust = 0.5, colour = "grey40"),
+          axis.text     = element_text(size = 12),
+          axis.title    = element_text(size = 14, face = "bold"),
+          legend.position = "right",
+          panel.grid.minor = element_line(color = "grey80", linewidth = 0.3),
+          strip.text = element_text(face = "bold", size = 11))
+  print(p)
+  safe_save(d$fig_dir, "county_temporal_counts.png", p, w = 14, h = 10)
+}
+```
+
+## County Choropleth Validation
+
+Side-by-side maps: observed vs predicted total case counts at county level,
+aggregated from county×day model output.
+Blue residuals = underprediction; red = overprediction; white = accurate.
+
+```{r county_choropleth_maps, fig.width=16, fig.height=8}
+for (m in months) {
+  cp <- agg_results[[m]]$county_period
+  if (is.null(cp) || nrow(cp) < 5) next
+
+  cmap <- merge(counties_sf, cp, by.x = "GEOID10", by.y = "fips_5", all.x = TRUE)
+  cmap$resid <- cmap$pred - cmap$obs
+
+  q99 <- quantile(c(cp$obs, cp$pred), 0.99, na.rm = TRUE)
+  q_resid <- quantile(abs(cp$pred - cp$obs), 0.99, na.rm = TRUE)
+
+  p_obs <- ggplot(cmap) +
+    geom_sf(aes(fill = pmin(obs, q99)), color = "grey40", linewidth = 0.4, alpha = 0.9) +
+    scale_fill_viridis_c(name = "Cases", option = "inferno",
+                         limits = c(0, q99), na.value = "grey90") +
+    labs(title = "Observed (total period)") + map_extras() + theme_map() +
+    theme(legend.position = "bottom") +
+    guides(fill = guide_colorbar(direction = "horizontal", title.position = "top",
+                                 barwidth = unit(8, "cm"), barheight = unit(3, "mm")))
+
+  p_pred <- ggplot(cmap) +
+    geom_sf(aes(fill = pmin(pred, q99)), color = "grey40", linewidth = 0.4, alpha = 0.9) +
+    scale_fill_viridis_c(name = "Cases", option = "inferno",
+                         limits = c(0, q99), na.value = "grey90") +
+    labs(title = "Predicted (total period)") + map_extras() + theme_map() +
+    theme(legend.position = "bottom") +
+    guides(fill = guide_colorbar(direction = "horizontal", title.position = "top",
+                                 barwidth = unit(8, "cm"), barheight = unit(3, "mm")))
+
+  p_resid <- ggplot(cmap) +
+    geom_sf(aes(fill = pmin(pmax(resid, -q_resid), q_resid)),
+            color = "grey40", linewidth = 0.4, alpha = 0.9) +
+    scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                         midpoint = 0, name = "Pred - Obs",
+                         limits = c(-q_resid, q_resid)) +
+    labs(title = "Prediction Residual") + map_extras() + theme_map() +
+    theme(legend.position = "bottom") +
+    guides(fill = guide_colorbar(direction = "horizontal", title.position = "top",
+                                 barwidth = unit(8, "cm"), barheight = unit(3, "mm")))
+
+  p_all <- (p_obs | p_pred | p_resid) +
+    plot_annotation(
+      title = paste("County Validation —", mlabels[m]),
+      theme = theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 14)))
+  print(p_all)
+  safe_save(all_data[[m]]$fig_dir, "county_validation_choropleth.png", p_all, w = 16, h = 7)
+}
+```
+
+# Mobility–Case Coupling (Post-fit)
+
+Pre-fit raw correlation between observed counts and `log_visits` per county
+over the 90-day wave window vs post-fit residual correlation. Cross-wave
+forest plot of the `log_visits` posterior shows how the coupling coefficient
+itself shifts.
+
+```{r coupling_postfit_data}
+coupling_dt <- list()
+for (m in months) {
+  d  <- all_data[[m]]
+  md <- readRDS(file.path(d$out_dir, "models", "model_data_gt.rds"))
+  gt <- as.data.table(md$gt_dt)
+  if (!"log_visits" %in% names(gt)) next
+  ft <- as.data.table(d$fitted_09b)
+  m2 <- merge(gt[, .(grid_id, time_id, Y, log_visits)],
+              ft[, .(grid_id, time_id, fitted_mean)],
+              by = c("grid_id", "time_id"))
+  m2[, resid := Y - fitted_mean]
+  cs <- m2[, .(
+    r_obs   = suppressWarnings(cor(Y,     log_visits, use = "complete.obs")),
+    r_resid = suppressWarnings(cor(resid, log_visits, use = "complete.obs")),
+    n_t     = .N
+  ), by = grid_id]
+  cs <- cs[is.finite(r_obs) & is.finite(r_resid) & n_t >= 20]
+  coupling_dt[[m]] <- cs
+}
+```
+
+```{r coupling_postfit_maps, fig.width=14, fig.height=6}
+for (m in months) {
+  cs <- coupling_dt[[m]]; if (is.null(cs) || !nrow(cs)) next
+  d  <- all_data[[m]]
+  sp <- merge(d$grid_sf, cs, by = "grid_id", all.x = FALSE)
+
+  rng <- max(abs(c(sp$r_obs, sp$r_resid)), na.rm = TRUE)
+  scale_div <- ggplot2::scale_fill_gradient2(
+    low = "#2166ac", mid = "white", high = "#b2182b",
+    midpoint = 0, limits = c(-rng, rng), name = "Pearson r")
+
+  p_obs <- ggplot(sp) + geom_sf(aes(fill = r_obs),
+                                 color = poly_color, linewidth = poly_lw) +
+    scale_div + labs(title = "Observed Y vs log_visits") + theme_map()
+  p_res <- ggplot(sp) + geom_sf(aes(fill = r_resid),
+                                 color = poly_color, linewidth = poly_lw) +
+    scale_div + labs(title = "Residual (Y - fitted) vs log_visits") + theme_map()
+
+  abs_drop <- mean(abs(cs$r_obs) - abs(cs$r_resid), na.rm = TRUE)
+  sub <- sprintf("%s — mean |r| absorbed by model: %+.3f (positive = signal absorbed)",
+                 mlabels[m], abs_drop)
+
+  p_all <- (p_obs | p_res) +
+    plot_annotation(title = "Mobility–case coupling (per county)",
+                    subtitle = sub,
+                    theme = theme(plot.title = element_text(face = "bold", hjust = 0.5),
+                                  plot.subtitle = element_text(hjust = 0.5)))
+  print(p_all)
+  safe_save(d$fig_dir, "mobility_coupling_residual.png", p_all, w = 14, h = 6)
+}
+```
+
+```{r coupling_postfit_forest, fig.width=8, fig.height=4}
+fe_all <- rbindlist(lapply(months, function(m) {
+  fe <- copy(all_data[[m]]$fixed_09b)
+  fe[, wave := mlabels[m]]
+  fe
+}), fill = TRUE)
+mob_fe <- fe_all[grepl("log_visits", covariate, ignore.case = TRUE)]
+if (nrow(mob_fe)) {
+  mob_fe[, se := (log(RR_upper) - log(RR)) / qnorm(0.975)]
+  mob_fe[, RR_66lo := exp(log(RR) + qnorm(0.17) * se)]
+  mob_fe[, RR_66hi := exp(log(RR) + qnorm(0.83) * se)]
+  p <- ggplot(mob_fe, aes(x = RR, y = wave, color = covariate)) +
+    geom_vline(xintercept = 1, linetype = "dashed", color = "grey50") +
+    geom_linerange(aes(xmin = RR_lower, xmax = RR_upper),
+                   linewidth = 0.5, alpha = 0.6,
+                   position = position_dodge(width = 0.4)) +
+    geom_linerange(aes(xmin = RR_66lo, xmax = RR_66hi),
+                   linewidth = 1.8,
+                   position = position_dodge(width = 0.4)) +
+    geom_point(size = 2.5, position = position_dodge(width = 0.4)) +
+    scale_color_brewer(palette = "Dark2") +
+    labs(title = "Mobility coefficient (log_visits) across waves",
+         x = "Relative Risk per 1-unit increase", y = NULL, color = NULL) +
+    theme_minimal() +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5),
+          legend.position = "bottom")
+  print(p)
+  safe_save(file.path(CONFIG$output_dir, "figures"),
+            paste0(state, "_mobility_coef_cross_wave.png"), p, w = 8, h = 4)
+}
+```
+
+# LISA Hotspot / Coldspot Map
+
+Local Indicators of Spatial Association (Anselin 1995) at county level.
+High-High (red) = spatial hotspot; Low-Low (blue) = coldspot.
+High-Low / Low-High = spatial outliers. Grey = not significant (FDR-adjusted p < 0.005).
+
+```{r lisa_hotspot, fig.width=14, fig.height=10}
+for (m in months) {
+  d <- all_data[[m]]
+  sp <- merge(d$grid_sf, d$spatial_09b[, .(grid_id, RR_spatial)],
+              by = "grid_id", all.x = FALSE)
+  sp <- sp[!is.na(sp$RR_spatial), ]
+
+  nb_lisa <- poly2nb(sp, queen = TRUE, snap = 10)
+  lw_lisa <- nb2listw(nb_lisa, style = "W", zero.policy = TRUE)
+
+  locm <- localmoran(sp$RR_spatial, lw_lisa, zero.policy = TRUE)
+  hs <- hotspot(locm, Prname = "Pr(z != E(Ii))", cutoff = 0.005,
+                droplevels = FALSE)
+  sp$cluster <- hs
+
+  cluster_cols <- c("Low-Low"  = "#2166AC", "Low-High" = "#92C5DE",
+                    "High-Low" = "#F4A582", "High-High" = "#B2182B")
+  sp$cluster_display <- as.character(sp$cluster)
+  sp$cluster_display[is.na(sp$cluster_display)] <- "Not significant"
+  sp$cluster_display <- factor(sp$cluster_display,
+    levels = c("High-High", "Low-High", "High-Low", "Low-Low", "Not significant"))
+
+  p <- ggplot() + cbg_base_layer(state = state) +
+    geom_sf(data = sp[sp$cluster_display == "Not significant", ],
+            fill = "grey90", color = "grey40", linewidth = 0.4) +
+    geom_sf(data = sp[sp$cluster_display != "Not significant", ],
+            aes(fill = cluster_display), color = "grey40", linewidth = 0.4) +
+    scale_fill_manual(values = c(cluster_cols, "Not significant" = "grey90"),
+                      name = "LISA Cluster", drop = FALSE) +
+    map_extras() +
+    labs(title = paste("Local Moran's I — LISA Cluster Cores |", mlabels[m]),
+         subtitle = paste0("FDR-adjusted p < 0.005  |  ",
+                           sum(!is.na(sp$cluster)), " significant counties of ",
+                           nrow(sp))) +
+    theme_map()
+  print(p)
+  safe_save(d$fig_dir, "lisa_hotspot_map.png", p, w = 12, h = 10)
+}
+```
+
+# Summary
+
+```{r summary}
+for (m in months)
+  cat(mlabels[m], ":", length(list.files(all_data[[m]]$fig_dir, "\\.png$")), "figures\n")
+cat("Cross-month:", length(list.files(file.path(CONFIG$output_dir, "figures"), "\\.png$")), "figures\n")
+```

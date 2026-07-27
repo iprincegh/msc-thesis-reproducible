@@ -1,0 +1,929 @@
+---
+title: "12 — Visualization & Validation"
+subtitle: "Post-model diagnostics, predictions, and summary figures"
+output: html_document
+params:
+  state: "NY"
+---
+
+<!--
+Unified visualization and validation, parameterized by state (NY / UT).
+Loads saved outputs from 09 (unified component model).
+Shared helpers (safe_save, load_month, etc.) live in _utils.R.
+
+Render for each state:
+  rmarkdown::render("12_visualization.Rmd", params = list(state = "NY"),
+                    output_file = "12_visualization_NY.html")
+  rmarkdown::render("12_visualization.Rmd", params = list(state = "UT"),
+                    output_file = "12_visualization_UT.html")
+
+NY: grid-level model → MODZCTA-level aggregated validation (rates per 100K)
+UT: county-level model → county-level validation (raw counts)
+
+── FIGURE INVENTORY ────────────────────────────────────────────────
+  Model fit summary table — WAIC/DIC/pD/RMSE/MAE/R²
+  Fixed effects forest plot — covariate RR with CIs
+  Spatial random effect map (BYM2, phi reported)
+  Temporal random effect wave (line + CI ribbon)
+  Temporal RR on exponentiated scale
+  Spatiotemporal interaction (heatmap + spaghetti + variance)
+  Spatiotemporal interaction numeric table
+  LISA hotspot — local Moran's I cluster cores
+-->
+
+```{r setup, include=FALSE}
+source(here::here("helpers/_utils.R"))
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE,
+                      fig.width = 12, fig.height = 8)
+```
+
+```{r libraries}
+library(data.table)
+library(sf)
+library(ggplot2)
+library(patchwork)
+library(viridis)
+library(ggspatial)
+library(RColorBrewer)
+library(knitr)
+library(spdep)
+library(scales)
+
+state <- params$state
+is_ny <- state == "NY"
+
+load_pipeline()
+target_state <- state
+WAVE_RUNS <- WAVE_RUNS[state == target_state, ]
+
+unit_label <- if (is_ny) "(g,t) grid\u00d7time" else "county\u00d7day"
+area_label <- if (is_ny) "Grid Cell" else "County"
+```
+
+```{r load_data}
+grid_sf0 <- st_read(file.path(CONFIG$grids_dir,
+                               sprintf("grid_100m_%s.gpkg", state)), quiet = TRUE)
+waves    <- WAVE_RUNS$wave_id
+all_data <- setNames(lapply(waves, load_wave, state = state,
+                            grid_sf0 = grid_sf0), waves)
+
+for (w in waves) {
+  dir.create(all_data[[w]]$fig_dir, recursive = TRUE, showWarnings = FALSE)
+  wm <- WAVE_RUNS[wave_id == w, wave_months][[1]]
+  all_data[[w]]$start_date   <- as.Date(paste0(wm[1], "-01"))
+  all_data[[w]]$month_breaks <- as.Date(paste0(wm[-1], "-01"))
+}
+dir.create(file.path(CONFIG$output_dir, "figures"),
+           recursive = TRUE, showWarnings = FALSE)
+
+if (is_ny) {
+  poly_color <- NA;  poly_lw <- 0
+  modzcta_sf <- st_read(file.path("data", "MODZCTA",
+    "geo_export_5392c927-ee1e-4b9c-9787-2cad9456c83b.shp"), quiet = TRUE) |>
+    st_transform(st_crs(grid_sf0))
+  min_pop_E <- 1000
+  for (w in waves) {
+    md <- readRDS(file.path(all_data[[w]]$out_dir, "models", "model_data_gt.rds"))
+    gt <- as.data.table(md$gt_dt)
+    gm <- unique(gt[, .(grid_id, modzcta = geo_id)])
+    gm <- gm[modzcta != "unknown" & modzcta != "99999"]
+    all_data[[w]]$grid_modzcta <- gm
+    all_data[[w]]$n_days       <- md$n_days
+  }
+} else {
+  poly_color <- "grey40";  poly_lw <- 0.4
+}
+
+# Load counties_sf (used for map overlays — UT only)
+if (!is_ny) {
+  counties_sf <- st_read(CONFIG$ut_counties_path, quiet = TRUE) |
+    st_transform(st_crs(grid_sf0))
+}
+```
+
+*State: `r state` | Spatial unit: `r area_label`*
+
+# Model Fit Summary
+
+```{r validation_metrics, results='asis'}
+all_metrics <- rbindlist(lapply(waves, function(m) {
+  dt <- copy(all_data[[m]]$comp_09b)
+  dt[, Month := mlabels[m]]
+  if (!"RMSE" %in% names(dt)) {
+    d <- all_data[[m]]
+    dt[, `:=`(RMSE = NA_real_, MAE = NA_real_, R2 = NA_real_)]
+    for (i in seq_len(nrow(dt))) {
+      mod_name <- dt$Model[i]
+      mo <- d$res09b$model_outputs[[mod_name]]
+      if (!is.null(mo) && !is.null(mo$fitted_values)) {
+        fv <- as.data.table(mo$fitted_values)
+        y  <- fv$Y; mu <- fv$fitted_mean
+        dt[i, RMSE := round(sqrt(mean((y - mu)^2, na.rm = TRUE)), 4)]
+        dt[i, MAE  := round(mean(abs(y - mu), na.rm = TRUE), 4)]
+        ss_res <- sum((y - mu)^2, na.rm = TRUE)
+        ss_tot <- sum((y - mean(y, na.rm = TRUE))^2, na.rm = TRUE)
+        dt[i, R2 := round(ifelse(ss_tot > 0, 1 - ss_res / ss_tot, NA_real_), 4)]
+      }
+    }
+  }
+  dt
+}), fill = TRUE)
+
+show_cols <- intersect(c("Month", "Model", "DIC", "WAIC", "dWAIC", "pD",
+                         "RMSE", "MAE", "R2", "Correlation"),
+                       names(all_metrics))
+tbl <- all_metrics[Status == "OK", ..show_cols]
+num_cols <- intersect(c("DIC", "WAIC", "dWAIC", "pD", "RMSE", "MAE", "R2", "Correlation"),
+                      names(tbl))
+for (col in num_cols) tbl[, (col) := round(get(col), 4)]
+
+print(kable(tbl, format = "pipe",
+            caption = paste("Model comparison at", unit_label,
+                            "level \u2014 WAIC, DIC, pD, RMSE, MAE, R\u00b2")))
+fwrite(all_metrics, file.path(CONFIG$output_dir, "figures",
+                              paste0(state, "_validation_metrics_all.csv")))
+```
+
+# Fixed Effects Forest Plot
+
+```{r fixed_effects, fig.width=10, fig.height=7}
+for (m in waves) {
+  d  <- all_data[[m]]
+  fe <- d$fixed_09b[covariate != "(Intercept)"]
+  fe[, se := (log(RR_upper) - log(RR)) / qnorm(0.975)]
+  fe[, RR_66lo := exp(log(RR) + qnorm(0.17) * se)]
+  fe[, RR_66hi := exp(log(RR) + qnorm(0.83) * se)]
+  p <- ggplot(fe, aes(x = RR, y = reorder(covariate, RR), color = significant)) +
+    geom_vline(xintercept = 1, linetype = "dashed", color = "grey50") +
+    geom_linerange(aes(xmin = RR_lower, xmax = RR_upper), linewidth = 0.5, alpha = 0.6) +
+    geom_linerange(aes(xmin = RR_66lo, xmax = RR_66hi), linewidth = 1.8) +
+    geom_point(size = 2.5) +
+    scale_color_manual(values = c("TRUE" = "#B2182B", "FALSE" = "#999999"),
+                       guide = "none") +
+    labs(title = d$best_model, x = "Relative Risk (exp(beta))", y = NULL) +
+    theme_minimal() +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5),
+          axis.text  = element_text(size = 12),
+          axis.title = element_text(size = 14, face = "bold")) +
+    main_annotation("Fixed Effects", mlabels[m])
+  safe_save(d$fig_dir, "fixed_effects_RR.png", p, w = 8, h = 7)
+  print(p)
+}
+```
+
+# Posterior-Predictive Overlay
+
+```{r ppc_overlay, fig.width=12, fig.height=8}
+# E6: PPC ribbon vs observed daily totals.
+# Samples 200 NB draws per cell using posterior-mean (mu, size), aggregates
+# to daily totals. Cheap approximation to a full posterior-predictive sweep
+# (which would need inla.posterior.sample with config=TRUE).
+set.seed(2024)
+N_PPC <- 200L
+ppc_panels <- list()
+for (m in waves) {
+  d  <- all_data[[m]]
+  mo <- d$res09b$model_outputs[[d$best_model]]
+  if (is.null(mo)) next
+
+  fv <- as.data.table(mo$fitted_values)
+  hyper   <- as.data.table(mo$hyperparameters)
+  nb_size <- hyper[grepl("size.*nbinomial", parameter, ignore.case = TRUE), mean][1]
+
+  mu_vec <- pmax(fv$fitted_mean, 0)
+  draws  <- matrix(rnbinom(length(mu_vec) * N_PPC,
+                           mu = rep(mu_vec, N_PPC), size = nb_size),
+                   nrow = length(mu_vec), ncol = N_PPC)
+  daily_draws <- rowsum(draws,    group = fv$time_id, na.rm = TRUE)
+  daily_obs   <- rowsum(fv$Y,     group = fv$time_id, na.rm = TRUE)
+  time_ids <- as.integer(rownames(daily_draws))
+  ppc_dt <- data.table(
+    time_id = time_ids,
+    date    = d$start_date + time_ids - 1L,
+    obs     = as.numeric(daily_obs),
+    lo      = apply(daily_draws, 1, quantile, probs = 0.025),
+    hi      = apply(daily_draws, 1, quantile, probs = 0.975),
+    med     = apply(daily_draws, 1, median))
+  cov95 <- mean(ppc_dt$obs >= ppc_dt$lo & ppc_dt$obs <= ppc_dt$hi)
+
+  ppc_panels[[m]] <- ggplot(ppc_dt, aes(x = date)) +
+    geom_ribbon(aes(ymin = lo, ymax = hi), fill = "#2166AC", alpha = 0.25) +
+    geom_line(aes(y = med), color = "#2166AC", linewidth = 0.4) +
+    geom_point(aes(y = obs), color = "#B2182B", size = 0.9) +
+    scale_x_date(date_labels = "%b %d", date_breaks = "10 days") +
+    labs(title = paste0(mlabels[m], "  |  PPC 95% coverage = ",
+                        round(100 * cov95, 1), "%"),
+         x = NULL, y = "Daily total cases") +
+    theme_minimal() +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 11),
+          axis.text.x = element_text(angle = 30, hjust = 1))
+
+  fwrite(ppc_dt, file.path(d$fig_dir, "ppc_daily_overlay.csv"))
+}
+if (length(ppc_panels) > 0) {
+  pp <- wrap_plots(ppc_panels, ncol = 1) +
+    plot_annotation(
+      title = "Posterior-Predictive Overlay (NB draws | best model)",
+      subtitle = paste0(N_PPC, " draws/cell, daily aggregation, ribbon = 95% PPC"),
+      theme = theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 14),
+                    plot.subtitle = element_text(hjust = 0.5, color = "grey40")))
+  print(pp)
+  safe_save(file.path(CONFIG$output_dir, "figures"),
+            paste0(state, "_ppc_daily_overlay.png"),
+            pp, w = 12, h = 4 * length(ppc_panels))
+}
+```
+
+# Model Components
+
+## Spatial Random Effect (BYM2)
+
+```{r z2_spatial_random_effect, fig.width=16, fig.height=12}
+for (m in waves) {
+  d  <- all_data[[m]]
+  sp <- as.data.table(d$spatial_09b)
+  n_areas <- nrow(sp) %/% 2L
+
+  structured   <- sp[idx_spatial <= n_areas]
+  unstructured <- sp[idx_spatial >  n_areas]
+  setorder(structured, idx_spatial)
+  setorder(unstructured, idx_spatial)
+
+  total_effect <- data.table(
+    grid_id = structured$grid_id,
+    structured_mean   = structured$mean,
+    unstructured_mean = unstructured$mean,
+    total_mean = structured$mean + unstructured$mean,
+    total_RR   = exp(structured$mean + unstructured$mean)
+  )
+  te_sf <- merge(d$grid_sf, total_effect, by = "grid_id", all.x = FALSE)
+
+  p1 <- ggplot(te_sf) +
+    geom_sf(aes(fill = structured_mean),
+            color = poly_color, linewidth = poly_lw, alpha = 0.9) +
+    scale_fill_viridis_c(option = "plasma", name = "Effect") +
+    labs(title = "Structured (ICAR)") +
+    theme_minimal() +
+    theme(axis.text = element_blank(), axis.title = element_blank(),
+          axis.ticks = element_blank(), panel.grid = element_blank(),
+          legend.position = "right",
+          plot.title = element_text(face = "bold", hjust = 0.5))
+
+  p2 <- ggplot(te_sf) +
+    geom_sf(aes(fill = unstructured_mean),
+            color = poly_color, linewidth = poly_lw, alpha = 0.9) +
+    scale_fill_viridis_c(option = "viridis", name = "Effect") +
+    labs(title = "Unstructured (IID)") +
+    theme_minimal() +
+    theme(axis.text = element_blank(), axis.title = element_blank(),
+          axis.ticks = element_blank(), panel.grid = element_blank(),
+          legend.position = "right",
+          plot.title = element_text(face = "bold", hjust = 0.5))
+
+  p3 <- ggplot(te_sf) +
+    geom_sf(aes(fill = total_mean),
+            color = poly_color, linewidth = poly_lw, alpha = 0.9) +
+    scale_fill_viridis_c(option = "magma", name = "Effect") +
+    labs(title = "Total Spatial Effect (log RR)") +
+    theme_minimal() +
+    theme(axis.text = element_blank(), axis.title = element_blank(),
+          axis.ticks = element_blank(), panel.grid = element_blank(),
+          legend.position = "right",
+          plot.title = element_text(face = "bold", hjust = 0.5))
+
+  p4 <- ggplot(te_sf) +
+    geom_sf(aes(fill = total_RR),
+            color = poly_color, linewidth = poly_lw, alpha = 0.9) +
+    scale_fill_viridis_c(option = "inferno", name = "RR",
+                         trans = "log",
+                         breaks = c(0.5, 1, 2, 4),
+                         labels = label_number(accuracy = 0.1)) +
+    guides(fill = guide_colorbar(barwidth = 1.2, barheight = 10)) +
+    labs(title = "Spatial Relative Risk (RR)") +
+    theme_minimal() +
+    theme(axis.text = element_blank(), axis.title = element_blank(),
+          axis.ticks = element_blank(), panel.grid = element_blank(),
+          legend.position = "right",
+          plot.title = element_text(face = "bold", hjust = 0.5))
+
+  # County value labels for UT (few polygons)
+  if (!is_ny) {
+    cents <- suppressWarnings(st_centroid(te_sf))
+    p3 <- p3 + geom_sf_text(data = cents, aes(label = round(total_mean, 2)),
+                             size = 2.5, fontface = "bold")
+    p4 <- p4 + geom_sf_text(data = cents, aes(label = round(total_RR, 2)),
+                             size = 2.5, fontface = "bold")
+  }
+
+  # BYM2 mixing parameter phi and variance decomposition
+  hyper <- as.data.table(d$res09b$model_outputs[[d$best_model]]$hyperparameters)
+  phi_row <- hyper[grepl("Phi", parameter)]
+  phi_val  <- if (nrow(phi_row) > 0) round(phi_row$mean, 3) else NA
+  phi_q025 <- if (nrow(phi_row) > 0) round(phi_row$`0.025quant`, 3) else NA
+  phi_q975 <- if (nrow(phi_row) > 0) round(phi_row$`0.975quant`, 3) else NA
+
+  struct_var   <- round(var(total_effect$structured_mean, na.rm = TRUE), 5)
+  unstruct_var <- round(var(total_effect$unstructured_mean, na.rm = TRUE), 5)
+  total_var    <- struct_var + unstruct_var
+  pct_struct   <- if (!is.na(total_var) && total_var > 0)
+    round(100 * struct_var / total_var, 1) else NA
+
+  phi_text <- ""
+  if (!is.na(phi_val))
+    phi_text <- paste0("  |  phi = ", phi_val, " (", phi_q025, ", ", phi_q975, ")")
+  var_text <- ""
+  if (!is.na(pct_struct))
+    var_text <- paste0("  |  Structured: ", pct_struct, "% of spatial variance")
+
+  p <- (p1 + p2) / (p3 + p4) +
+    plot_annotation(
+      title = paste("Spatial Random Effects (BYM2) \u2014", mlabels[m]),
+      subtitle = paste0("Model: ", d$best_model, phi_text, var_text),
+      theme = theme(plot.title    = element_text(face = "bold", hjust = 0.5, size = 14),
+                    plot.subtitle = element_text(hjust = 0.5, colour = "grey40")))
+  safe_save(d$fig_dir, "z2_spatial_random_effects.png", p, w = 16, h = 12)
+  print(p)
+
+  if (!is.na(phi_val)) {
+  }
+}
+```
+
+## Temporal Random Effect
+
+```{r z3_despike_helper}
+# despike_temporal() is defined in _utils.R (loaded above)
+```
+
+```{r z3_temporal_random_effect, fig.width=12, fig.height=6}
+for (m in waves) {
+  d  <- all_data[[m]]
+  tp <- as.data.table(d$temporal_09b)
+  start <- d$start_date
+  tp[, date := start + idx_temporal - 1L]
+
+  # Despike month-boundary artifacts (legacy: monthly-Advan only).
+  # Gated by USE_DESPIKE (FALSE by default since switching to weekly Advan).
+  if (isTRUE(USE_DESPIKE) && length(d$month_breaks) > 0) {
+    tp[, mean := despike_temporal(tp, d$month_breaks, "mean")]
+    tp[, q025 := despike_temporal(tp, d$month_breaks, "q025")]
+    tp[, q975 := despike_temporal(tp, d$month_breaks, "q975")]
+    tp[, sd := despike_temporal(tp, d$month_breaks, "sd", threshold = 0.05)]
+  }
+
+  p <- ggplot(tp, aes(x = date, y = mean)) +
+    geom_vline(xintercept = d$month_breaks, linetype = "dotted",
+              color = "grey50", linewidth = 0.5) +
+    geom_ribbon(aes(ymin = q025, ymax = q975), fill = "#4393C3", alpha = 0.2) +
+    geom_ribbon(aes(ymin = mean - sd, ymax = mean + sd), fill = "#4393C3", alpha = 0.35) +
+    geom_line(linewidth = 1, color = "#2166AC") +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+    geom_point(size = 1.5, color = "#2166AC") +
+    scale_x_date(date_labels = "%b %d", date_breaks = "5 days") +
+    labs(x = "Date", y = "Effect Size (log scale)",
+         title = paste("Temporal Random Effect \u2014", mlabels[m]),
+         subtitle = paste("Model:", d$best_model,
+                          " |  Bands: +/-1 sigma (dark), 95% CI (light)")) +
+    theme_minimal() +
+    theme(
+      axis.text   = element_text(size = 12),
+      axis.title  = element_text(size = 14, face = "bold"),
+      plot.title  = element_text(face = "bold", hjust = 0.5, size = 14),
+      plot.subtitle = element_text(hjust = 0.5, colour = "grey40"),
+      panel.grid.minor = element_line(color = "grey80", linewidth = 0.3)
+    )
+  safe_save(d$fig_dir, "z3_temporal_random_effect.png", p, w = 12, h = 6)
+  print(p)
+}
+```
+
+## Temporal Relative Risk
+
+```{r z3b_temporal_rr, fig.width=12, fig.height=6}
+for (m in waves) {
+  d  <- all_data[[m]]
+  tp <- as.data.table(d$temporal_09b)
+  start <- d$start_date
+  tp[, date := start + idx_temporal - 1L]
+
+  # Despike month-boundary artifacts (legacy: monthly-Advan only).
+  # Gated by USE_DESPIKE (FALSE by default since switching to weekly Advan).
+  if (isTRUE(USE_DESPIKE) && length(d$month_breaks) > 0) {
+    tp[, mean := despike_temporal(tp, d$month_breaks, "mean")]
+    tp[, q025 := despike_temporal(tp, d$month_breaks, "q025")]
+    tp[, q975 := despike_temporal(tp, d$month_breaks, "q975")]
+    tp[, RR_temporal := exp(mean)]
+  }
+  tp[, `:=`(rr_lo = exp(q025), rr_hi = exp(q975))]
+
+  p <- ggplot(tp, aes(x = date, y = RR_temporal)) +
+    geom_vline(xintercept = d$month_breaks, linetype = "dotted",
+              color = "grey50", linewidth = 0.5) +
+    geom_ribbon(aes(ymin = rr_lo, ymax = rr_hi), fill = "#D6604D", alpha = 0.2) +
+    geom_line(linewidth = 1, color = "#B2182B") +
+    geom_point(size = 1.5, color = "#B2182B") +
+    geom_hline(yintercept = 1, linetype = "dashed", color = "gray50") +
+    scale_x_date(date_labels = "%b %d", date_breaks = "5 days") +
+    labs(x = "Date", y = "Temporal Relative Risk",
+         title = paste("Temporal RR \u2014", mlabels[m]),
+         subtitle = paste("Model:", d$best_model, " |  95% Credible Interval")) +
+    theme_minimal() +
+    theme(
+      axis.text   = element_text(size = 12),
+      axis.title  = element_text(size = 14, face = "bold"),
+      plot.title  = element_text(face = "bold", hjust = 0.5, size = 14),
+      plot.subtitle = element_text(hjust = 0.5, colour = "grey40"),
+      panel.grid.minor = element_line(color = "grey80", linewidth = 0.3)
+    )
+  safe_save(d$fig_dir, "z3b_temporal_rr.png", p, w = 12, h = 6)
+  print(p)
+}
+```
+
+## Spatiotemporal Interaction
+
+```{r z4_compute_delta}
+z4_data <- list()
+for (m in waves) {
+  d  <- all_data[[m]]
+  ft <- as.data.table(d$fitted_09b)
+  sp <- as.data.table(d$spatial_09b)
+  tp <- as.data.table(d$temporal_09b)
+  n_areas <- nrow(sp) %/% 2L
+
+  sp_s <- sp[idx_spatial <= n_areas]; setorder(sp_s, idx_spatial)
+  sp_u <- sp[idx_spatial >  n_areas]; setorder(sp_u, idx_spatial)
+  sp_total <- data.table(grid_id = sp_s$grid_id,
+                         sp_mean = sp_s$mean + sp_u$mean)
+  tp_dt <- data.table(time_id = tp$idx_temporal, tp_mean = tp$mean)
+
+  ft[, log_RR := log(pmax(RR, 1e-10))]
+  ft <- merge(ft, sp_total, by = "grid_id")
+  ft <- merge(ft, tp_dt,    by = "time_id")
+  ft[, delta_gt := log_RR - sp_mean - tp_mean]
+  ft[, delta_gt := delta_gt - mean(delta_gt, na.rm = TRUE)]
+  ft <- ft[is.finite(delta_gt)]
+
+  grid_n <- ft[, .N, by = grid_id]
+  ft <- ft[grid_id %in% grid_n[N >= 2, grid_id]]
+  z4_data[[m]] <- ft
+}
+```
+
+```{r z4_spatiotemporal_interaction, fig.width=16, fig.height=10}
+for (m in waves) {
+  d  <- all_data[[m]]
+  ft <- z4_data[[m]]
+  start <- d$start_date
+
+  st_mat <- ft[, .(st_mean = mean(delta_gt, na.rm = TRUE)),
+               by = .(grid_id, time_id)]
+  st_mat[, date := start + time_id - 1L]
+  mb <- d$month_breaks
+
+  # Spatial labels: county names for UT, grid_id for NY
+  g_dt <- as.data.table(st_drop_geometry(d$grid_sf))
+  if (!is_ny && "county_name" %in% names(g_dt)) {
+    st_mat <- merge(st_mat, g_dt[, .(grid_id, county_name)],
+                    by = "grid_id", all.x = TRUE)
+    st_mat[, spatial_label := county_name]
+  } else {
+    st_mat[, spatial_label := as.character(grid_id)]
+  }
+
+  # NY: top 40 by variance; UT: all counties
+  if (is_ny) {
+    var_by_grid <- st_mat[, .(var_st = var(st_mean, na.rm = TRUE)), by = grid_id]
+    top_grids   <- var_by_grid[order(-var_st)][1:min(40, nrow(var_by_grid)), grid_id]
+    st_mat_sub  <- st_mat[grid_id %in% top_grids]
+  } else {
+    st_mat_sub <- st_mat
+  }
+
+  q_st <- quantile(abs(st_mat_sub$st_mean), 0.99, na.rm = TRUE)
+
+  p_heat <- ggplot(st_mat_sub, aes(x = date,
+                                    y = reorder(spatial_label, st_mean),
+                                    fill = pmin(pmax(st_mean, -q_st), q_st))) +
+    geom_tile() +
+    scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                         midpoint = 0, name = "ST Effect",
+                         limits = c(-q_st, q_st)) +
+    scale_x_date(date_labels = "%b %d", date_breaks = "5 days") +
+    labs(x = "Date", y = area_label,
+         title = "Spatiotemporal Interaction Heatmap") +
+    theme_minimal() +
+    theme(axis.text.y = element_text(size = 8),
+          axis.text.x = element_text(size = 11),
+          axis.title  = element_text(size = 14, face = "bold"),
+          plot.title  = element_text(face = "bold", hjust = 0.5))
+
+  p_lines <- ggplot(st_mat_sub, aes(x = date, y = st_mean,
+                                     group = spatial_label, color = spatial_label)) +
+    geom_vline(xintercept = mb, linetype = "dotted",
+              color = "grey50", linewidth = 0.5) +
+    geom_line(alpha = 0.6, linewidth = 0.6) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+    scale_x_date(date_labels = "%b %d", date_breaks = "5 days") +
+    labs(x = "Date", y = "ST Interaction Effect",
+         title = "Location-specific Temporal Deviations") +
+    theme_minimal() +
+    theme(legend.position = if (is_ny) "none" else "right",
+          legend.text  = element_text(size = 7),
+          legend.title = element_blank(),
+          axis.text    = element_text(size = 12),
+          axis.title   = element_text(size = 14, face = "bold"),
+          panel.grid.minor = element_line(color = "grey80", linewidth = 0.3),
+          plot.title   = element_text(face = "bold", hjust = 0.5))
+
+  # Variance map
+  var_map_dt <- ft[, .(st_var = var(delta_gt, na.rm = TRUE)), by = grid_id]
+  var_sf <- merge(d$grid_sf, var_map_dt, by = "grid_id", all.x = FALSE)
+
+  p_var_map <- ggplot(var_sf) +
+    geom_sf(aes(fill = st_var), color = poly_color, linewidth = poly_lw) +
+    scale_fill_viridis_c(option = "rocket", name = "Variance", direction = -1) +
+    labs(title = "ST Interaction Variability") +
+    theme_minimal() +
+    theme(axis.text = element_blank(), axis.title = element_blank(),
+          axis.ticks = element_blank(), panel.grid = element_blank(),
+          plot.title = element_text(face = "bold", hjust = 0.5))
+
+  if (!is_ny) {
+    cents <- suppressWarnings(st_centroid(var_sf))
+    p_var_map <- p_var_map +
+      geom_sf_text(data = cents, aes(label = round(st_var, 2)),
+                   size = 2.2, fontface = "bold")
+  }
+
+  p <- (p_heat / (p_lines | p_var_map)) +
+    plot_annotation(
+      title = paste("Spatiotemporal Interaction \u2014", mlabels[m]),
+      subtitle = paste("Model:", d$best_model,
+                       " |  \u03b4(g,t) = log RR - u(g) - \u03b3(t)"),
+      theme = theme(plot.title    = element_text(face = "bold", hjust = 0.5, size = 14),
+                    plot.subtitle = element_text(hjust = 0.5, colour = "grey40")))
+  safe_save(d$fig_dir, "z4_spatiotemporal_interaction.png", p, w = 16, h = 10)
+  print(p)
+}
+```
+
+## Spatiotemporal Interaction — Numeric Table
+
+```{r z4b_st_table, results='asis'}
+for (m in waves) {
+  d  <- all_data[[m]]
+  ft <- z4_data[[m]]
+
+  st_summary <- ft[, .(
+    mean_st  = round(mean(delta_gt), 4),
+    sd_st    = round(sd(delta_gt), 4),
+    min_st   = round(min(delta_gt), 4),
+    max_st   = round(max(delta_gt), 4),
+    range_st = round(max(delta_gt) - min(delta_gt), 4)
+  ), by = grid_id]
+
+  if (!is_ny) {
+    g_dt <- as.data.table(st_drop_geometry(d$grid_sf))
+    if ("county_name" %in% names(g_dt))
+      st_summary <- merge(st_summary, g_dt[, .(grid_id, county_name)],
+                          by = "grid_id", all.x = TRUE)
+  }
+
+  setorder(st_summary, -range_st)
+  print(kable(head(st_summary, 40), format = "pipe", digits = 4,
+              caption = paste("\u03b4(g,t) by", tolower(area_label), "\u2014", mlabels[m])))
+
+  tbl_dir <- file.path(all_data[[m]]$out_dir, "tables")
+  fwrite(st_summary, file.path(tbl_dir, "spatiotemporal_interaction_summary.csv"))
+}
+```
+
+# ZCTA-level Validation
+
+Observed vs predicted daily case counts at MODZCTA×day resolution.
+Aggregated from grid×day model output via the `grid_modzcta` lookup.
+Points near the 1:1 diagonal indicate accurate predictions.
+Solid (fitted) vs dashed (observed) lines reveal temporal tracking.
+
+```{r zcta_data_prep, eval=is_ny}
+agg_results <- list()
+for (m in waves) {
+  ft <- as.data.table(all_data[[m]]$fitted_09b)
+  gm <- as.data.table(all_data[[m]]$grid_modzcta)
+  ft <- merge(ft, gm, by = "grid_id", all.x = FALSE)
+  zd <- ft[, .(Y = sum(Y, na.rm = TRUE),
+               fitted_mean = sum(fitted_mean, na.rm = TRUE)),
+           by = .(modzcta, time_id)]
+  zp <- zd[, .(obs = sum(Y, na.rm = TRUE),
+               pred = sum(fitted_mean, na.rm = TRUE)),
+           by = modzcta]
+  agg_results[[m]] <- list(zcta_day = zd, zcta_period = zp)
+}
+```
+
+```{r zcta_table, results='asis', eval=is_ny}
+zcta_int_metrics <- rbindlist(lapply(waves, function(m) {
+  zd <- agg_results[[m]]$zcta_day
+  zp <- agg_results[[m]]$zcta_period
+  if (is.null(zd) || nrow(zd) < 5) return(NULL)
+  data.table(
+    Wave       = mlabels[m],
+    N_zctas    = uniqueN(zd$modzcta),
+    RMSE       = round(sqrt(mean((zd$Y - zd$fitted_mean)^2)), 2),
+    MAE        = round(mean(abs(zd$Y - zd$fitted_mean)), 2),
+    Corr       = round(cor(zd$Y, zd$fitted_mean, use = "complete"), 4),
+    R2         = round(1 - sum((zd$Y - zd$fitted_mean)^2) /
+                          sum((zd$Y - mean(zd$Y))^2), 4),
+    RMSE_total = round(sqrt(mean((zp$obs - zp$pred)^2)), 2),
+    Corr_total = round(cor(zp$obs, zp$pred, use = "complete"), 4)
+  )
+}))
+cat("\n### Validation: Observed vs Predicted ZCTA-Day Counts\n\n")
+print(kable(zcta_int_metrics, format = "pipe",
+            caption = "ZCTA-day prediction accuracy (raw counts)"))
+fwrite(zcta_int_metrics, file.path(CONFIG$output_dir, "figures",
+       paste0(state, "_zcta_internal_metrics.csv")))
+for (m in waves) {
+  fwrite(agg_results[[m]]$zcta_period,
+         file.path(all_data[[m]]$out_dir, "tables",
+                   "zcta_validation_detail.csv"))
+}
+```
+
+```{r zcta_scatter, fig.width=14, fig.height=10, eval=is_ny}
+scatter_list <- list()
+for (m in waves) {
+  zd <- agg_results[[m]]$zcta_day
+  if (is.null(zd) || nrow(zd) < 5) next
+  r2  <- 1 - sum((zd$Y - zd$fitted_mean)^2) / sum((zd$Y - mean(zd$Y))^2)
+  rho <- cor(zd$Y, zd$fitted_mean, use = "complete")
+  rmse <- sqrt(mean((zd$Y - zd$fitted_mean)^2))
+  scatter_list[[m]] <- ggplot(zd, aes(x = Y, y = fitted_mean)) +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "grey50") +
+    geom_point(alpha = 0.5, color = "#2166AC", size = 1.6) +
+    geom_smooth(method = "lm", se = TRUE, color = "#B2182B", linewidth = 0.8, alpha = 0.2) +
+    annotate("text", x = Inf, y = -Inf, hjust = 1.1, vjust = -0.5, size = 3.5,
+             label = sprintf("R\u00b2 = %.3f\nr = %.3f\nRMSE = %.1f", r2, rho, rmse)) +
+    labs(title = mlabels[m],
+         x = "Observed Cases (ZCTA-day)",
+         y = "Predicted Cases (ZCTA-day)") +
+    theme_minimal() + theme(plot.title = element_text(face = "bold", hjust = 0.5))
+}
+if (length(scatter_list) > 0) {
+  p <- wrap_plots(scatter_list, ncol = min(3, length(scatter_list))) +
+    plot_annotation(
+      title = "ZCTA-Day Validation: Observed vs Predicted",
+      subtitle = paste("Best model:", all_data[[waves[1]]]$best_model),
+      theme = theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 14),
+                    plot.subtitle = element_text(hjust = 0.5, color = "grey40")))
+  print(p)
+  safe_save(file.path(CONFIG$output_dir, "figures"),
+            paste0(state, "_zcta_day_scatter.png"), p,
+            w = min(18, 6 * length(scatter_list)),
+            h = ceiling(length(scatter_list) / 3) * 6)
+}
+```
+
+## ZCTA Temporal Count Comparison
+
+Top/bottom 5 ZCTAs by mean observed daily count.
+Solid = fitted, dashed = observed.
+
+```{r zcta_temporal, fig.width=14, fig.height=10, eval=is_ny}
+n_extreme <- 5
+for (m in waves) {
+  d  <- all_data[[m]]
+  zd <- copy(agg_results[[m]]$zcta_day)
+  if (is.null(zd) || nrow(zd) < 5) next
+  zd[, date := d$start_date + time_id - 1L]
+  zday <- zd[, .(obs = sum(Y, na.rm = TRUE),
+                 pred = sum(fitted_mean, na.rm = TRUE)),
+             by = .(modzcta, date)]
+  avg_count <- zday[, .(avg = mean(obs, na.rm = TRUE)), by = modzcta]
+  top_ids <- head(avg_count[order(-avg)], n_extreme)$modzcta
+  bot_ids <- head(avg_count[order( avg)], n_extreme)$modzcta
+  pd <- zday[modzcta %in% c(top_ids, bot_ids)]
+  pd[, group := fifelse(modzcta %in% top_ids,
+                        "Highest-count ZCTAs", "Lowest-count ZCTAs")]
+  pd_long <- rbind(
+    pd[, .(modzcta, date, count = obs,  type = "Observed", group)],
+    pd[, .(modzcta, date, count = pred, type = "Fitted",   group)]
+  )
+  p <- ggplot(pd_long, aes(x = date, y = count,
+                            color = modzcta, linetype = type)) +
+    geom_line(linewidth = 0.7, alpha = 0.85) +
+    scale_linetype_manual(values = c("Fitted" = "solid", "Observed" = "dashed")) +
+    facet_wrap(~ group, scales = "free_y", ncol = 1) +
+    scale_x_date(date_labels = "%b %d", date_breaks = "5 days") +
+    labs(x = NULL, y = "Daily Case Count",
+         color = "MODZCTA", linetype = "Type",
+         title = paste("Observed vs Fitted Case Counts \u2014", mlabels[m]),
+         subtitle = paste0("Model: ", d$best_model,
+                           "  |  Top/Bottom ", n_extreme,
+                           " ZCTAs by avg daily count",
+                           "  |  Solid = fitted, Dashed = observed")) +
+    theme_minimal() +
+    theme(plot.title    = element_text(face = "bold", hjust = 0.5),
+          plot.subtitle = element_text(size = 10, hjust = 0.5, colour = "grey40"),
+          legend.position = "right",
+          strip.text = element_text(face = "bold", size = 11))
+  print(p)
+  safe_save(d$fig_dir, "zcta_temporal_counts.png", p, w = 14, h = 10)
+}
+```
+
+## ZCTA Choropleth Validation
+
+Side-by-side maps: observed vs predicted total case counts at ZCTA level.
+Blue residual = underprediction; red = overprediction.
+
+```{r zcta_choropleth, fig.width=16, fig.height=8, eval=is_ny}
+for (m in waves) {
+  zp <- agg_results[[m]]$zcta_period
+  if (is.null(zp) || nrow(zp) < 5) next
+  zmap <- merge(modzcta_sf, zp, by.x = "modzcta", by.y = "modzcta", all.x = TRUE)
+  zmap$resid <- zmap$pred - zmap$obs
+  q99 <- quantile(c(zp$obs, zp$pred), 0.99, na.rm = TRUE)
+  q_resid <- quantile(abs(zp$pred - zp$obs), 0.99, na.rm = TRUE)
+
+  p_obs <- ggplot(zmap) +
+    geom_sf(aes(fill = pmin(obs, q99)), color = NA, alpha = 0.9) +
+    scale_fill_viridis_c(name = "Cases", option = "inferno",
+                         limits = c(0, q99), na.value = "grey90") +
+    labs(title = "Observed (total period)") + theme_map() +
+    theme(legend.position = "bottom") +
+    guides(fill = guide_colorbar(direction = "horizontal", title.position = "top",
+                                 barwidth = unit(8, "cm"), barheight = unit(3, "mm")))
+  p_pred <- ggplot(zmap) +
+    geom_sf(aes(fill = pmin(pred, q99)), color = NA, alpha = 0.9) +
+    scale_fill_viridis_c(name = "Cases", option = "inferno",
+                         limits = c(0, q99), na.value = "grey90") +
+    labs(title = "Predicted (total period)") + theme_map() +
+    theme(legend.position = "bottom") +
+    guides(fill = guide_colorbar(direction = "horizontal", title.position = "top",
+                                 barwidth = unit(8, "cm"), barheight = unit(3, "mm")))
+  p_resid <- ggplot(zmap) +
+    geom_sf(aes(fill = pmin(pmax(resid, -q_resid), q_resid)),
+            color = NA, alpha = 0.9) +
+    scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                         midpoint = 0, name = "Pred - Obs",
+                         limits = c(-q_resid, q_resid)) +
+    labs(title = "Prediction Residual") + theme_map() +
+    theme(legend.position = "bottom") +
+    guides(fill = guide_colorbar(direction = "horizontal", title.position = "top",
+                                 barwidth = unit(8, "cm"), barheight = unit(3, "mm")))
+  p_all <- (p_obs | p_pred | p_resid) +
+    plot_annotation(
+      title = paste("ZCTA Validation \u2014", mlabels[m]),
+      theme = theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 14)))
+  print(p_all)
+  safe_save(all_data[[m]]$fig_dir, "zcta_validation_choropleth.png", p_all, w = 16, h = 7)
+}
+```
+
+# Mobility–Case Coupling (Post-fit)
+
+Style mirrors Niraula 2024's coupling diagnostics. Each wave gets:
+(i) raw per-grid `cor(Y_t, log_visits_t)` over the 90-day window,
+(ii) post-fit `cor(Y_t - fitted_mean_t, log_visits_t)` — if the model absorbed
+the mobility signal correctly the residual coupling collapses toward zero,
+and (iii) a cross-wave forest plot of the `log_visits` posterior, showing
+how the coupling coefficient itself shifts across waves.
+
+```{r coupling_postfit_data}
+coupling_dt <- list()
+for (m in waves) {
+  d  <- all_data[[m]]
+  md <- readRDS(file.path(d$out_dir, "models", "model_data_gt.rds"))
+  gt <- as.data.table(md$gt_dt)
+  if (!"log_visits" %in% names(gt)) next
+  ft <- as.data.table(d$fitted_09b)
+  m2 <- merge(gt[, .(grid_id, time_id, Y, log_visits)],
+              ft[, .(grid_id, time_id, fitted_mean)],
+              by = c("grid_id", "time_id"))
+  m2[, resid := Y - fitted_mean]
+  cs <- m2[, .(
+    r_obs   = suppressWarnings(cor(Y,     log_visits, use = "complete.obs")),
+    r_resid = suppressWarnings(cor(resid, log_visits, use = "complete.obs")),
+    n_t     = .N
+  ), by = grid_id]
+  cs <- cs[is.finite(r_obs) & is.finite(r_resid) & n_t >= 20]
+  coupling_dt[[m]] <- cs
+}
+```
+
+```{r coupling_postfit_maps, fig.width=14, fig.height=6}
+for (m in waves) {
+  cs <- coupling_dt[[m]]; if (is.null(cs) || !nrow(cs)) next
+  d  <- all_data[[m]]
+  sp <- merge(d$grid_sf, cs, by = "grid_id", all.x = FALSE)
+
+  rng <- max(abs(c(sp$r_obs, sp$r_resid)), na.rm = TRUE)
+  scale_div <- ggplot2::scale_fill_gradient2(
+    low = "#2166ac", mid = "white", high = "#b2182b",
+    midpoint = 0, limits = c(-rng, rng), name = "Pearson r")
+
+  p_obs <- ggplot(sp) + geom_sf(aes(fill = r_obs), color = NA) +
+    scale_div + labs(title = "Observed Y vs log_visits") + theme_map()
+  p_res <- ggplot(sp) + geom_sf(aes(fill = r_resid), color = NA) +
+    scale_div + labs(title = "Residual (Y - fitted) vs log_visits") + theme_map()
+
+  abs_drop <- mean(abs(cs$r_obs) - abs(cs$r_resid), na.rm = TRUE)
+  sub <- sprintf("%s — mean |r| absorbed by model: %+.3f (positive = signal absorbed)",
+                 mlabels[m], abs_drop)
+
+  p_all <- (p_obs | p_res) +
+    plot_annotation(title = "Mobility–case coupling (per grid)",
+                    subtitle = sub,
+                    theme = theme(plot.title = element_text(face = "bold", hjust = 0.5),
+                                  plot.subtitle = element_text(hjust = 0.5)))
+  print(p_all)
+  safe_save(d$fig_dir, "mobility_coupling_residual.png", p_all, w = 14, h = 6)
+}
+```
+
+```{r coupling_postfit_forest, fig.width=8, fig.height=4}
+fe_all <- rbindlist(lapply(waves, function(m) {
+  fe <- copy(all_data[[m]]$fixed_09b)
+  fe[, wave := mlabels[m]]
+  fe
+}), fill = TRUE)
+mob_fe <- fe_all[grepl("log_visits", covariate, ignore.case = TRUE)]
+if (nrow(mob_fe)) {
+  mob_fe[, se := (log(RR_upper) - log(RR)) / qnorm(0.975)]
+  mob_fe[, RR_66lo := exp(log(RR) + qnorm(0.17) * se)]
+  mob_fe[, RR_66hi := exp(log(RR) + qnorm(0.83) * se)]
+  p <- ggplot(mob_fe, aes(x = RR, y = wave, color = covariate)) +
+    geom_vline(xintercept = 1, linetype = "dashed", color = "grey50") +
+    geom_linerange(aes(xmin = RR_lower, xmax = RR_upper),
+                   linewidth = 0.5, alpha = 0.6,
+                   position = position_dodge(width = 0.4)) +
+    geom_linerange(aes(xmin = RR_66lo, xmax = RR_66hi),
+                   linewidth = 1.8,
+                   position = position_dodge(width = 0.4)) +
+    geom_point(size = 2.5, position = position_dodge(width = 0.4)) +
+    scale_color_brewer(palette = "Dark2") +
+    labs(title = "Mobility coefficient (log_visits) across waves",
+         x = "Relative Risk per 1-unit increase", y = NULL, color = NULL) +
+    theme_minimal() +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5),
+          legend.position = "bottom")
+  print(p)
+  safe_save(file.path(CONFIG$output_dir, "figures"),
+            paste0(state, "_mobility_coef_cross_wave.png"), p, w = 8, h = 4)
+}
+```
+
+# LISA Hotspot / Coldspot Map
+
+```{r lisa_hotspot, fig.width=14, fig.height=10}
+for (m in waves) {
+  d <- all_data[[m]]
+  sp <- merge(d$grid_sf, d$spatial_09b[, .(grid_id, RR_spatial)],
+              by = "grid_id", all.x = FALSE)
+  sp <- sp[!is.na(sp$RR_spatial), ]
+
+  nb_lisa <- poly2nb(sp, queen = TRUE, snap = 10)
+  lw_lisa <- nb2listw(nb_lisa, style = "W", zero.policy = TRUE)
+
+  locm <- localmoran(sp$RR_spatial, lw_lisa, zero.policy = TRUE)
+  hs <- hotspot(locm, Prname = "Pr(z != E(Ii))", cutoff = 0.005,
+                droplevels = FALSE)
+  sp$cluster <- hs
+
+  cluster_cols <- c("Low-Low"  = "#2166AC", "Low-High" = "#92C5DE",
+                    "High-Low" = "#F4A582", "High-High" = "#B2182B")
+  sp$cluster_display <- as.character(sp$cluster)
+  sp$cluster_display[is.na(sp$cluster_display)] <- "Not significant"
+  sp$cluster_display <- factor(sp$cluster_display,
+    levels = c("High-High", "Low-High", "High-Low", "Low-Low", "Not significant"))
+
+  p <- ggplot() + cbg_base_layer(state = state) +
+    geom_sf(data = sp[sp$cluster_display == "Not significant", ],
+            fill = "grey90", color = poly_color, linewidth = poly_lw) +
+    geom_sf(data = sp[sp$cluster_display != "Not significant", ],
+            aes(fill = cluster_display), color = poly_color, linewidth = poly_lw) +
+    scale_fill_manual(values = c(cluster_cols, "Not significant" = "grey90"),
+                      name = "LISA Cluster", drop = FALSE) +
+    map_extras() +
+    labs(title = paste("Local Moran's I \u2014 LISA Cluster Cores |", mlabels[m]),
+         subtitle = paste0("FDR-adjusted p < 0.005  |  ",
+                           sum(!is.na(sp$cluster)), " significant ",
+                           tolower(area_label), "s of ", nrow(sp))) +
+    theme_map()
+  safe_save(d$fig_dir, "lisa_hotspot_map.png", p, w = 12, h = 10)
+  print(p)
+}
+```
+
+# Summary
+
+```{r summary}
+for (m in waves) {
+  d <- all_data[[m]]
+  cat("\n###", mlabels[m], "\n")
+  cat("- Best model:", d$best_model, "\n")
+  cat("- Figures saved to:", d$fig_dir, "\n")
+}
+```

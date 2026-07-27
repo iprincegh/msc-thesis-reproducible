@@ -1,0 +1,833 @@
+---
+title: "10a – Temporal Cross-Validation"
+subtitle: "Rolling-origin forward CV for the WAIC-best model per wave"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+params:
+  run_waves: "all"
+---
+
+## Overview
+
+For each state×wave we cross-validate the WAIC-best model declared by
+`09_fit_model` (see `BEST_MODEL_BY_WAVE` in `helpers/_cv_helpers.R`) using
+rolling-origin forward CV with horizon h = 3 days.
+
+CPO is computed inside every fold's INLA fit over the TRAINING half (the
+held-out cells carry NA Y so they're excluded from CPO automatically).
+Fold-level LCPO + failure count land in `fold_diag` next to the holdout
+CRPS / coverage scores, giving us a complete LOO-on-train + CRPS-on-test
+picture for the WAIC-best per-wave model:
+
+  NY_wave1 = NLMob_ST_IV   NY_wave2 = LinMob_ST_IV   NY_wave3 = LinMob_ST_IV
+  UT_wave1 = NLMob_ST_IV   UT_wave2 = NLMob_ST_IV    UT_wave3 = NLMob_ST_IV
+
+```{r setup, include=FALSE}
+source(here::here("helpers/_utils.R"))
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 12, fig.height = 8)
+```
+
+## Setup
+
+```{r load}
+suppressPackageStartupMessages({
+  library(data.table)
+  library(INLA)
+  library(sf)
+  library(spdep)
+  library(ggplot2)
+  library(patchwork)
+  library(viridis)
+  library(scales)
+  library(knitr)
+})
+
+Sys.unsetenv("MallocStackLogging")
+# Threading and solver selection only affect runtime, not posteriors.
+# CV_NUM_THREADS overrides the INLA thread config; FIT_USE_PARDISO=1 uses
+# Pardiso instead of the default TAUCS solver.
+.cv_nthr <- Sys.getenv("CV_NUM_THREADS", "4:9")
+inla.setOption(num.threads = .cv_nthr)
+inla.setOption(inla.mode = "compact")
+.pardiso_env <- tolower(Sys.getenv("FIT_USE_PARDISO", ""))
+if (!.pardiso_env %in% c("", "0", "false", "no", "off")) {
+  inla.setOption(smtp = "pardiso")
+  .pchk <- tryCatch(capture.output(INLA::inla.pardiso.check()),
+                    error = function(e) conditionMessage(e))
+  message("[10a] PARDISO enabled | num.threads=", .cv_nthr,
+          " | inla.pardiso.check: ", paste(.pchk, collapse = " "))
+} else {
+  inla.setOption(smtp = "taucs")
+  message("[10a] PARDISO disabled (FIT_USE_PARDISO='", .pardiso_env,
+          "') | smtp=taucs | num.threads=", .cv_nthr)
+}
+
+source(here::here("helpers/_adjacency.R"))
+source(here::here("helpers/_cv_helpers.R"))
+load_pipeline()
+
+log_msg <- function(...) {
+  msg <- paste0(sprintf("[%s] ", format(Sys.time(), "%H:%M:%S")),
+                paste0(c(...), collapse = ""))
+  cat(msg, "\n", sep = "")
+  flush.console()
+  side <- Sys.getenv("CV_SIDE_LOG", "")
+  if (nzchar(side)) cat(msg, "\n", file = side, append = TRUE, sep = "")
+}
+```
+
+## Configuration
+
+```{r config}
+# h = 3 days (operational area-level horizon; used by downstream figures).
+CV_HORIZONS  <- 3L
+# Minimum training fraction; override with CV_MIN_TRAIN.
+CV_MIN_TRAIN <- as.numeric(Sys.getenv("CV_MIN_TRAIN", "0.50"))
+if (!is.finite(CV_MIN_TRAIN) || CV_MIN_TRAIN <= 0 || CV_MIN_TRAIN >= 1)
+  CV_MIN_TRAIN <- 0.50
+
+# Maximum training fraction; override with CV_MAX_TRAIN.
+CV_MAX_TRAIN <- as.numeric(Sys.getenv("CV_MAX_TRAIN", "0.95"))
+if (!is.finite(CV_MAX_TRAIN) || CV_MAX_TRAIN <= CV_MIN_TRAIN ||
+    CV_MAX_TRAIN > 1) CV_MAX_TRAIN <- 1.00
+
+# Origin cadence: NY defaults to 7d, UT to 3d. CV_STEP_NY may reduce
+# the number of NY origins for faster runs.
+CV_STEP_NY <- as.integer(Sys.getenv("CV_STEP_NY", "7"))
+CV_STEP_UT <- as.integer(Sys.getenv("CV_STEP_UT", "3"))
+if (!is.finite(CV_STEP_NY) || CV_STEP_NY < 1L) CV_STEP_NY <- 7L
+if (!is.finite(CV_STEP_UT) || CV_STEP_UT < 1L) CV_STEP_UT <- 3L
+
+# Outlier-trim quantile for holdout scoring. Training is unchanged.
+CV_OUTLIER_Q <- 0.999
+
+# Mobility attribution draws per origin. 0 disables draws; 200 is the
+# default cost/precision tradeoff.
+.cv_fast_env <- isTRUE(as.logical(Sys.getenv("CV_FAST", "FALSE")))
+CV_POSTERIOR_DRAWS <- as.integer(Sys.getenv(
+  "CV_POSTERIOR_DRAWS",
+  if (.cv_fast_env) "0" else "200"))
+if (!is.finite(CV_POSTERIOR_DRAWS) || CV_POSTERIOR_DRAWS < 0L)
+  CV_POSTERIOR_DRAWS <- if (.cv_fast_env) 0L else 200L
+
+# Cell-level Y is left uncapped (NB handles tails). The data audit below
+# verifies the empirical Y distribution before the CV loop starts.
+```
+
+## Data audit
+
+```{r audit, results='asis'}
+audit_rows <- list()
+for (w in c("NY_wave1","NY_wave2","NY_wave3","UT_wave1","UT_wave2","UT_wave3")) {
+  f <- file.path(CONFIG$output_dir, w, "models", "model_data_gt.rds")
+  if (!file.exists(f)) next
+  dt <- as.data.table(readRDS(f)$gt_dt)
+  audit_rows[[w]] <- data.table(
+    wave         = w,
+    n_cells      = uniqueN(dt$grid_id),
+    n_days       = uniqueN(dt$idx_temporal),
+    n_geo        = if ("geo_id" %in% names(dt)) uniqueN(dt$geo_id) else NA_integer_,
+    Y_max        = max(dt$Y, na.rm = TRUE),
+    Y_Q99        = as.numeric(quantile(dt$Y, 0.99,  na.rm = TRUE)),
+    Y_Q999       = as.numeric(quantile(dt$Y, 0.999, na.rm = TRUE)),
+    pct_Y_zero   = round(100 * mean(dt$Y == 0, na.rm = TRUE), 2),
+    grid_eq_geo  = ("geo_id" %in% names(dt)) &&
+                    all(as.character(dt$grid_id) == as.character(dt$geo_id)))
+}
+audit <- rbindlist(audit_rows, fill = TRUE)
+print(kable(audit, format = "pipe",
+            caption = "Cell-day Y distribution per wave (no Y capping applied)"))
+```
+
+**Interpretation.**
+NY cell-day Y is integer ∈ [0, 12] across all three waves — disaggregation
+artefact, NB handles cleanly. UT shows tail spikes (Y_max up to several
+thousand on Omicron) but `grid_eq_geo = TRUE` confirms the UT grid is the
+county itself, so cell-level CV doubles as the geographic-aggregation CV; no
+extra MODZCTA layer exists or is needed. No outliers are excluded.
+
+## Per-wave forward CV (helper)
+
+```{r cv_helpers}
+# ── Rolling-origin temporal CV for cell-level holdouts. ----------------------
+# `geo_id_vec` may be NULL (UT) or character (NY). When provided, area-level
+# aggregates are produced as a side product so NY can do cell-CV and
+# MODZCTA-CV in a single set of INLA refits.
+run_temporal_cv <- function(md, wave_label, model_name, step,
+                            warmstart_theta = NULL, ckpt_dir = NULL,
+                            geo_id_vec = NULL) {
+
+  fm <- md$fms[[model_name]]
+  if (is.null(fm)) stop(sprintf("No formula for model '%s'", model_name))
+  if (!is.null(ckpt_dir)) dir.create(ckpt_dir, recursive = TRUE, showWarnings = FALSE)
+
+  h         <- CV_HORIZONS
+  n_days    <- md$n_days
+  min_train <- ceiling(n_days * CV_MIN_TRAIN)
+  # CV_MAX_TRAIN drops dead-tail origins (default 0.95 = skip last 5% of
+  # wave window). NY_wave3 t0=87 (87/90=0.967) -> excluded; t0=80
+  # (80/90=0.889) -> kept. See config block for rationale.
+  max_t0    <- min(n_days - h, floor(n_days * CV_MAX_TRAIN))
+  origins   <- seq(min_train, max_t0, by = step)
+  log_msg(sprintf("  [%s | %s] step=%d  %d origins (t0 in [%d, %d])",  
+                  wave_label, model_name, step,
+                  length(origins), min(origins), max(origins)))
+
+  # Exclude underpowered units from the holdout when n_units <= 100
+  # (UT only). They stay in training but are not scored.
+  total_grids <- length(unique(as.character(md$df$grid_id)))
+  if (total_grids <= getOption("cv_eval_unit_cap", 100L)) {
+    eval_grids <- compute_eval_units(md$df, unit_col = "grid_id", y_col = "Y")
+    is_eval_row <- as.character(md$df$grid_id) %in% eval_grids
+    log_msg(sprintf("  [%s | %s] eval-eligible grids: %d / %d (sparse units kept in training, not scored)",
+                    wave_label, model_name, length(eval_grids), total_grids))
+  } else {
+    is_eval_row <- rep(TRUE, nrow(md$df))
+    log_msg(sprintf("  [%s | %s] %d grids (>cap) -> sparse-unit filter disabled",
+                    wave_label, model_name, total_grids))
+  }
+
+  strat_cols <- intersect(c("area_strat", "urban_class", "wave_phase"),
+                           names(md$df))
+
+  window_scores <- list()
+  strat_scores  <- list()
+  daily_all     <- list()
+  modz_all      <- list()
+  holdout_long  <- list()
+  attr_cells    <- list()  # A1: per-cell counterfactual mu + delta with CrIs
+  attr_pcatm    <- list()  # A1: per-origin PCAtM summary with CrIs
+  attr_betas    <- list()  # A1+C1: per-origin mob-beta posterior summary
+  attr_inputs   <- list()  # A3: per-origin X_oof + beta_draws for re-aggregation
+  fold_diag     <- list()  # C1: per-origin hyperparameter + full beta diagnostics
+  current_warm  <- warmstart_theta
+  total_runtime <- 0
+  n_fail        <- 0L
+  has_geo       <- !is.null(geo_id_vec)
+
+  for (i in seq_along(origins)) {
+    t0 <- origins[i]
+    holdout_idx <- which(md$df$idx_temporal > t0 & md$df$idx_temporal <= t0 + h
+                         & is_eval_row)
+    if (length(holdout_idx) == 0) next
+
+    ckpt_f <- if (!is.null(ckpt_dir))
+      file.path(ckpt_dir, sprintf("t%05d.rds", t0)) else NULL
+    if (!is.null(ckpt_f) && file.exists(ckpt_f)) {
+      cp <- readRDS(ckpt_f)
+      window_scores[[length(window_scores) + 1]] <- cp$ws
+      daily_all[[length(daily_all) + 1]]         <- cp$daily_w
+      if (!is.null(cp$modz_w))    modz_all[[length(modz_all) + 1]]         <- cp$modz_w
+      if (!is.null(cp$strat_w))   strat_scores[[length(strat_scores) + 1]] <- cp$strat_w
+      if (!is.null(cp$holdout_w)) holdout_long[[length(holdout_long) + 1]] <- cp$holdout_w
+      # Only adopt ckpt$theta when it matches the current warmstart length.
+      if (!is.null(cp$theta) && is.numeric(cp$theta) &&
+          (is.null(current_warm) || length(cp$theta) == length(current_warm)))
+        current_warm <- cp$theta
+      if (!is.null(cp$fold_diag_row)) {
+        fold_diag[[length(fold_diag) + 1]] <- cp$fold_diag_row
+        if (!is.null(cp$fixed_full))
+          attr(fold_diag[[length(fold_diag)]], "fixed_full") <- cp$fixed_full
+      }
+      ws_log <- if ("outlier_mode" %in% names(cp$ws))
+                  cp$ws[outlier_mode == "all"][1] else cp$ws[1]
+      total_runtime <- total_runtime + (ws_log$runtime %||% 0)
+      log_msg(sprintf("    [%s | %s] origin %d/%d (t0=%d): RESUME ckpt | R2=%.3f",
+                      wave_label, model_name, i, length(origins), t0, ws_log$R2))
+      next
+    }
+
+    hf <- fit_holdout(md, fm, holdout_idx,
+                      label = sprintf("%s [t0=%d] %s", model_name, t0, wave_label),
+                      warmstart_theta = current_warm,
+                      model_name = model_name,
+                      n_attr_draws = CV_POSTERIOR_DRAWS)
+    if (!hf$ok) {
+      n_fail <- n_fail + 1L
+      log_msg(sprintf("    [%s | %s] origin %d/%d (t0=%d): FAILED",
+                      wave_label, model_name, i, length(origins), t0))
+      gc(full = TRUE); next
+    }
+    total_runtime <- total_runtime + hf$runtime
+    if (!is.null(hf$theta) && is.numeric(hf$theta)) current_warm <- hf$theta
+
+    # Out-of-fold mobility attribution.
+    if (!is.null(hf$attribution)) {
+      a  <- hf$attribution
+      ce <- copy(a$cell_attr)
+      ce[, `:=`(origin = t0, horizon = h,
+                grid_id  = as.character(md$df$grid_id[holdout_idx]),
+                time_id  = md$df$idx_temporal[holdout_idx],
+                geo_id   = if (has_geo) geo_id_vec[holdout_idx] else NA_character_)]
+      attr_cells[[length(attr_cells) + 1]] <- ce
+      ps <- copy(a$pcatm_summary); ps[, `:=`(origin = t0, horizon = h)]
+      attr_pcatm[[length(attr_pcatm) + 1]] <- ps
+      bs <- copy(a$beta_summary);  bs[, `:=`(origin = t0)]
+      attr_betas[[length(attr_betas) + 1]] <- bs
+      attr_inputs[[as.character(t0)]] <- list(
+        origin     = t0,
+        mob_covs   = a$mob_covs,
+        X_oof      = a$X_oof,
+        beta_draws = a$beta_draws,
+        grid_id    = as.character(md$df$grid_id[holdout_idx]),
+        time_id    = md$df$idx_temporal[holdout_idx],
+        geo_id     = if (has_geo) geo_id_vec[holdout_idx] else NULL)
+    }
+
+    # Per-origin coefficient and hyperparameter diagnostics.
+    fd_row <- data.table(origin = t0, horizon = h,
+                         runtime_min = round(hf$runtime, 1),
+                         n_oof = length(holdout_idx),
+                         nb_size = hf$nb_size %||% NA_real_,
+                         family = hf$family %||% NA_character_,
+                         LCPO        = hf$cpo_train_lcpo     %||% NA_real_,
+                         cpo_n_train = hf$cpo_train_n        %||% NA_integer_,
+                         cpo_failures = hf$cpo_train_failures %||% NA_integer_,
+                         pred_disp = { mu_v <- hf$mu[is.finite(hf$mu)]
+                                       if (length(mu_v) > 1)
+                                         var(mu_v) / max(mean(mu_v), 1e-12)
+                                       else NA_real_ })
+    if (!is.null(hf$theta) && is.numeric(hf$theta)) {
+      th <- as.list(hf$theta); names(th) <- paste0("theta_", seq_along(hf$theta))
+      fd_row <- cbind(fd_row, as.data.table(th))
+    }
+    fold_diag[[length(fold_diag) + 1]] <- fd_row
+
+    # Full beta posterior for coefficient stability.
+    if (!is.null(hf$fixed_full)) {
+      ff <- as.data.table(hf$fixed_full, keep.rownames = "covariate")
+      ff[, `:=`(origin = t0)]
+      # Stored as a side list element on fold_diag[[end]]; serialized via
+      # writeRDS of the full coef stability log in save_cv_outputs.
+      attr(fold_diag[[length(fold_diag)]], "fixed_full") <- ff
+    }
+
+    # Outlier flag for scoring only, not training.
+    mu_safe <- pmax(hf$mu, 1e-6)
+    if (!is.null(hf$nb_size) && is.finite(hf$nb_size) && hf$nb_size > 0) {
+      q_hi <- qnbinom(CV_OUTLIER_Q, size = hf$nb_size, mu = mu_safe)
+    } else {
+      q_hi <- qpois(CV_OUTLIER_Q,  lambda = mu_safe)
+    }
+    is_outlier <- !is.na(hf$y_true) & hf$y_true > q_hi
+    pct_out <- if (length(hf$y_true) > 0) mean(is_outlier, na.rm = TRUE) else 0
+
+    # Score all holdout cells and a trimmed subset without outliers.
+    ws_all  <- cv_scores(hf$y_true, hf$mu, hf$sd_fit, nb_size = hf$nb_size,
+                         family = hf$family %||% "auto")
+    ws_all[, `:=`(origin = t0, runtime = round(hf$runtime, 1),
+                  outlier_mode = "all", pct_outlier = pct_out)]
+    keep <- !is_outlier
+    ws_trim <- cv_scores(hf$y_true[keep], hf$mu[keep], hf$sd_fit[keep],
+                         nb_size = hf$nb_size,
+                         family = hf$family %||% "auto")
+    ws_trim[, `:=`(origin = t0, runtime = round(hf$runtime, 1),
+                   outlier_mode = sprintf("trimmed_q%03d",
+                                          round(1000 * CV_OUTLIER_Q)),
+                   pct_outlier = pct_out)]
+    window_scores[[length(window_scores) + 1]] <- rbind(ws_all, ws_trim, fill = TRUE)
+
+    log_msg(sprintf("    [%s | %s] origin %d/%d (t0=%d): %.1f min | RMSE=%.2f/%.2f R2=%.3f/%.3f CRPS=%.3f/%.3f Cov95=%.3f outl=%.2f%%",
+                    wave_label, model_name, i, length(origins), t0, hf$runtime,
+                    ws_all$RMSE, ws_trim$RMSE,
+                    ws_all$R2,   ws_trim$R2,
+                    ws_all$CRPS, ws_trim$CRPS,
+                    ws_all$Cov95, 100 * pct_out))
+
+    # Persist the outlier flag so downstream consumers can re-trim.
+    if (!is.null(hf$holdout_dt))
+      hf$holdout_dt[, is_outlier := is_outlier]
+
+    # Stratified scores (one row per stratum-level per origin).
+    strat_w <- if (length(strat_cols) > 0 && !is.null(hf$holdout_dt)) {
+      rbindlist(lapply(strat_cols, function(sc) {
+        ss <- cv_scores_stratified(hf$holdout_dt$y_true, hf$holdout_dt$mu,
+                                   hf$holdout_dt$sd_fit,
+                                   nb_size = hf$nb_size,
+                                   group = hf$holdout_dt[[sc]],
+                                   group_name = "stratum_value",
+                                   family = hf$family %||% "auto")
+        if (nrow(ss) == 0) return(NULL)
+        ss[, `:=`(stratum = sc, origin = t0, horizon = h)]
+        ss
+      }), fill = TRUE)
+    } else NULL
+    if (!is.null(strat_w) && nrow(strat_w) > 0)
+      strat_scores[[length(strat_scores) + 1]] <- strat_w
+
+    # Per cell-day holdout table with strata.
+    hl <- copy(hf$holdout_dt); hl[, `:=`(origin = t0, horizon = h)]
+    holdout_long[[length(holdout_long) + 1]] <- hl
+
+    # Daily aggregate across cells; sd from NB predictive variance.
+    ho_dt <- data.table(time_id = hf$time_id,
+                        y_true = hf$y_true, mu = hf$mu, sd_fit = hf$sd_fit,
+                        pred_var = nb_pred_var(hf$mu, hf$sd_fit, hf$nb_size))
+    daily_w <- ho_dt[, .(obs = sum(y_true, na.rm = TRUE),
+                         pred = sum(mu, na.rm = TRUE),
+                         sd = sqrt(sum(pred_var, na.rm = TRUE))), by = time_id]
+    daily_w[, `:=`(origin = t0, lead = time_id - t0,
+                   lo = pmax(pred - 1.96 * sd, 0), hi = pred + 1.96 * sd)]
+    daily_all[[length(daily_all) + 1]] <- daily_w
+
+    # NY-only MODZCTA × day aggregate.
+    modz_w <- NULL
+    if (has_geo) {
+      gho <- copy(ho_dt); gho[, geo_id := geo_id_vec[holdout_idx]]
+      modz_w <- gho[, .(obs = sum(y_true, na.rm = TRUE),
+                        pred = sum(mu, na.rm = TRUE),
+                        sd = sqrt(sum(pred_var, na.rm = TRUE)),
+                        n_grids = .N), by = .(geo_id, time_id)]
+      modz_w[, `:=`(origin = t0, lo = pmax(pred - 1.96 * sd, 0),
+                    hi = pred + 1.96 * sd)]
+      modz_all[[length(modz_all) + 1]] <- modz_w
+    }
+
+    if (!is.null(ckpt_f)) {
+      # Save the current per-origin diagnostics so resume works without re-fit.
+      ck_fd_row    <- if (length(fold_diag)) fold_diag[[length(fold_diag)]] else NULL
+      ck_fixed_ful <- if (!is.null(ck_fd_row)) attr(ck_fd_row, "fixed_full") else NULL
+      saveRDS(list(ws = ws_all, daily_w = daily_w, modz_w = modz_w,
+                   strat_w = strat_w, holdout_w = hl, theta = current_warm,
+                   fold_diag_row = ck_fd_row, fixed_full = ck_fixed_ful),
+              ckpt_f)
+    }
+    rm(hf, ho_dt, hl); gc(full = TRUE)
+  }
+
+  if (length(window_scores) == 0) return(NULL)
+
+  ws_dt    <- rbindlist(window_scores, fill = TRUE)
+  daily_dt <- rbindlist(daily_all)
+  hold_dt  <- if (length(holdout_long) > 0) rbindlist(holdout_long, fill = TRUE) else data.table()
+  strat_dt <- if (length(strat_scores) > 0) rbindlist(strat_scores, fill = TRUE) else data.table()
+  modz_dt  <- if (length(modz_all)     > 0) rbindlist(modz_all,     fill = TRUE) else NULL
+
+  # Per-day aggregate across origins (mean pred; sd = sqrt(mean sd^2)).
+  daily_agg <- daily_dt[, .(obs = obs[1], pred = mean(pred),
+                            sd  = sqrt(mean(sd^2)),
+                            n_origins = .N), by = time_id][order(time_id)]
+  daily_agg[, `:=`(lo = pmax(pred - 1.96 * sd, 0), hi = pred + 1.96 * sd)]
+
+  # NY-only MODZCTA day and total aggregates.
+  modz_day_agg <- NULL; modz_totals <- NULL
+  if (!is.null(modz_dt)) {
+    modz_day_agg <- modz_dt[, .(obs = obs[1], pred = mean(pred),
+                                sd  = sqrt(mean(sd^2)),
+                                n_grids = n_grids[1],
+                                n_origins = .N),
+                            by = .(geo_id, time_id)][order(geo_id, time_id)]
+    modz_day_agg[, `:=`(lo = pmax(pred - 1.96 * sd, 0), hi = pred + 1.96 * sd)]
+    modz_totals <- modz_day_agg[, .(obs_total  = sum(obs),
+                                    pred_total = sum(pred),
+                                    sd_total   = sqrt(sum(sd^2)),
+                                    n_days     = .N),
+                                by = geo_id]
+    modz_totals[, `:=`(lo = pmax(pred_total - 1.96 * sd_total, 0),
+                       hi = pred_total + 1.96 * sd_total)]
+  }
+
+  strat_agg <- if (nrow(strat_dt) > 0) {
+    score_cols <- intersect(c("RMSE","MAE","R2","CRPS","Cov50","Cov80","Cov95",
+                              "Cov95_gauss","logS","DSS","cal_intercept",
+                              "cal_slope","pit_W1","N"), names(strat_dt))
+    strat_dt[, c(list(n_origins = .N),
+                 lapply(.SD, mean, na.rm = TRUE)),
+             by = .(stratum, stratum_value), .SDcols = score_cols]
+  } else data.table()
+
+  # Cell-level summary scores (averaged across origins, split by outlier_mode)
+  # + daily aggregates. Daily-aggregate columns are mode-agnostic (cell-level
+  # outliers are masked from per-cell metrics only; daily sums use all cells
+  # because the daily aggregate already absorbs cell-level idiosyncrasies).
+  ws_dt[, outlier_mode := if ("outlier_mode" %in% names(ws_dt))
+                            outlier_mode else "all"]
+  score_cols <- intersect(c("RMSE","MAE","R2","CRPS","Cov50","Cov80","Cov95",
+                            "Cov95_gauss","logS","DSS","cal_intercept",
+                            "cal_slope","pit_W1"), names(ws_dt))
+  cell_scores_by_mode <- ws_dt[, c(list(
+      wave = wave_label, model = model_name, horizon = h,
+      n_windows = .N, n_fail = n_fail,
+      N = sum(N, na.rm = TRUE),
+      pct_outlier = mean(pct_outlier, na.rm = TRUE)),
+      lapply(.SD, mean, na.rm = TRUE)),
+      by = outlier_mode, .SDcols = score_cols]
+  setcolorder(cell_scores_by_mode, c("wave","model","horizon","outlier_mode"))
+
+  # Back-compat: use the "all" row and add daily aggregates.
+  cs_all <- cell_scores_by_mode[outlier_mode == "all"]
+  if (nrow(cs_all) == 0) cs_all <- cell_scores_by_mode[1]
+  cell_scores <- copy(cs_all)
+  cell_scores[, `:=`(
+    n_test_days   = nrow(daily_agg),
+    Cov95_NB_daily = mean(daily_agg$obs >= daily_agg$lo & daily_agg$obs <= daily_agg$hi),
+    daily_bias    = mean(daily_agg$pred - daily_agg$obs),
+    daily_RMSE    = sqrt(mean((daily_agg$obs - daily_agg$pred)^2)),
+    daily_relRMSE = { m <- mean(daily_agg$obs)
+                      if (m > 0) sqrt(mean((daily_agg$obs - daily_agg$pred)^2)) / m else NA_real_ },
+    runtime_min   = round(total_runtime, 1))]
+
+  modz_scores <- if (!is.null(modz_day_agg)) {
+    data.table(
+      wave = wave_label, model = model_name, horizon = h,
+      n_modzctas = nrow(modz_totals),
+      modzcta_day_R2     = cor(modz_day_agg$obs, modz_day_agg$pred)^2,
+      modzcta_day_bias   = mean(modz_day_agg$pred - modz_day_agg$obs),
+      modzcta_day_Cov95  = mean(modz_day_agg$obs >= modz_day_agg$lo &
+                                 modz_day_agg$obs <= modz_day_agg$hi),
+      modzcta_total_R2   = cor(modz_totals$obs_total, modz_totals$pred_total)^2,
+      modzcta_total_Corr = cor(modz_totals$obs_total, modz_totals$pred_total),
+      modzcta_total_MdAPE = median(abs(modz_totals$pred_total - modz_totals$obs_total) /
+                                     pmax(modz_totals$obs_total, 1)) * 100,
+      modzcta_total_Cov95 = mean(modz_totals$obs_total >= modz_totals$lo &
+                                  modz_totals$obs_total <= modz_totals$hi))
+  } else NULL
+
+  # Attribution and diagnostic aggregates.
+  attr_cells_dt <- if (length(attr_cells) > 0) rbindlist(attr_cells, fill = TRUE) else NULL
+  attr_pcatm_dt <- if (length(attr_pcatm) > 0) rbindlist(attr_pcatm, fill = TRUE) else NULL
+  attr_betas_dt <- if (length(attr_betas) > 0) rbindlist(attr_betas, fill = TRUE) else NULL
+  fold_diag_dt  <- if (length(fold_diag)  > 0) rbindlist(fold_diag,  fill = TRUE) else NULL
+  # Per-origin beta stability across folds.
+  beta_stab_dt <- if (length(fold_diag) > 0) {
+    rbindlist(lapply(fold_diag, function(fd) attr(fd, "fixed_full")), fill = TRUE)
+  } else NULL
+
+  list(cell_scores = cell_scores, cell_scores_by_mode = cell_scores_by_mode,
+       modz_scores = modz_scores,
+       daily_agg = daily_agg, daily_raw = daily_dt,
+       window_scores = ws_dt, stratified = strat_agg, stratified_long = strat_dt,
+       modz_day_agg = modz_day_agg, modz_totals = modz_totals,
+       holdout_long = hold_dt,
+       attr_cells = attr_cells_dt, attr_pcatm = attr_pcatm_dt,
+       attr_betas = attr_betas_dt, attr_inputs = attr_inputs,
+       fold_diag = fold_diag_dt, beta_stability = beta_stab_dt)
+}
+```
+
+## Empirical recalibration of daily PIs
+
+```{r calibration_helper}
+# Recalibrate daily PIs to account for within-day correlation.
+recalibrate_daily <- function(daily_raw) {
+  d <- daily_raw[is.finite(sd) & sd > 0]
+  if (nrow(d) < 10) return(NULL)
+  z <- (d$obs - d$pred) / d$sd; z <- z[is.finite(z)]
+  c_infl <- sd(z, na.rm = TRUE)
+  q025   <- as.numeric(quantile(z, 0.025, na.rm = TRUE))
+  q975   <- as.numeric(quantile(z, 0.975, na.rm = TRUE))
+  d_agg <- d[, .(obs = obs[1], pred = mean(pred),
+                 sd_model = sqrt(mean(sd^2)),
+                 n_origins = .N), by = time_id][order(time_id)]
+  d_agg[, `:=`(lo_model     = pmax(pred - 1.96 * sd_model, 0),
+               hi_model     =      pred + 1.96 * sd_model,
+               lo_scaled    = pmax(pred - 1.96 * c_infl * sd_model, 0),
+               hi_scaled    =      pred + 1.96 * c_infl * sd_model,
+               lo_empirical = pmax(pred + q025 * sd_model, 0),
+               hi_empirical =      pred + q975 * sd_model)]
+  d_agg[, `:=`(in_model     = obs >= lo_model     & obs <= hi_model,
+               in_scaled    = obs >= lo_scaled    & obs <= hi_scaled,
+               in_empirical = obs >= lo_empirical & obs <= hi_empirical)]
+  list(daily = d_agg,
+       summary = data.table(
+         n_obs = nrow(d), n_days = nrow(d_agg),
+         z_mean = mean(z, na.rm = TRUE),
+         inflation_c = c_infl, q025_z = q025, q975_z = q975,
+         Cov95_model = mean(d_agg$in_model),
+         Cov95_scaled = mean(d_agg$in_scaled),
+         Cov95_empirical = mean(d_agg$in_empirical)))
+}
+```
+
+## Save helper
+
+```{r save_helper}
+# Write validation outputs. Always save under by_model/<model>.
+# Mirror to the wave-level validation folder only for the WAIC-best model.
+save_cv_outputs <- function(wave_name, model_name, res, is_best) {
+  base    <- file.path(CONFIG$output_dir, wave_name, "validation")
+  by_mod  <- file.path(base, "by_model", model_name)
+  dir.create(by_mod, recursive = TRUE, showWarnings = FALSE)
+
+  write_pair <- function(d, fname_by_model, fname_legacy = NULL) {
+    if (is.null(d) || nrow(d) == 0) return(invisible(NULL))
+    fwrite(d, file.path(by_mod, fname_by_model))
+    if (is_best && !is.null(fname_legacy))
+      fwrite(d, file.path(base, fname_legacy))
+  }
+
+  # Daily / cell-level outputs (always).
+  write_pair(res$cell_scores,    "temporal_cv_scores.csv",        "temporal_cv_scores.csv")
+  write_pair(res$cell_scores_by_mode,
+                                 "temporal_cv_scores_by_mode.csv","temporal_cv_scores_by_mode.csv")
+  write_pair(res$window_scores,  "temporal_cv_window_scores.csv", "temporal_cv_window_scores.csv")
+  write_pair(res$daily_agg,      "temporal_cv_daily_h3.csv",      "temporal_cv_daily_h3.csv")
+  write_pair(res$daily_raw,      "temporal_cv_daily_raw_h3.csv",  "temporal_cv_daily_raw_h3.csv")
+
+  if (!is.null(res$stratified) && nrow(res$stratified) > 0) {
+    for (sname in unique(res$stratified$stratum)) {
+      d <- res$stratified[stratum == sname]
+      fwrite(d, file.path(by_mod, sprintf("temporal_cv_scores_by_%s.csv", sname)))
+      if (is_best)
+        fwrite(d, file.path(base, sprintf("temporal_cv_scores_by_%s_h3.csv", sname)))
+    }
+  }
+
+  # NY-only MODZCTA outputs.
+  if (!is.null(res$modz_scores)) {
+    write_pair(res$modz_scores,   "modzcta_temporal_cv_scores.csv",        "modzcta_temporal_cv_scores.csv")
+    write_pair(res$modz_day_agg,  "modzcta_temporal_cv_modzcta_day.csv",   "modzcta_temporal_cv_modzcta_day.csv")
+    write_pair(res$modz_totals,   "modzcta_temporal_cv_modzcta_totals.csv","modzcta_temporal_cv_modzcta_totals.csv")
+    write_pair(res$daily_agg,     "modzcta_temporal_cv_daily.csv",         "modzcta_temporal_cv_daily.csv")
+  }
+
+  # Calibrated daily PIs.
+  cal <- recalibrate_daily(res$daily_raw)
+  if (!is.null(cal)) {
+    fwrite(cal$daily,   file.path(by_mod, "temporal_cv_daily_h3_calibrated.csv"))
+    cal_sum <- cbind(data.table(wave = wave_name, model = model_name), cal$summary)
+    fwrite(cal_sum,     file.path(by_mod, "daily_calibration.csv"))
+    if (is_best) {
+      fwrite(cal$daily, file.path(base, "temporal_cv_daily_h3_calibrated.csv"))
+      fwrite(cal_sum,   file.path(base, "daily_calibration.csv"))
+    }
+  }
+
+  # Mobility attribution outputs.
+  write_pair(res$attr_cells, "attribution_cell_long.csv", "attribution_cell_long.csv")
+  write_pair(res$attr_pcatm, "attribution_pcatm.csv",      "attribution_pcatm.csv")
+  write_pair(res$attr_betas, "attribution_beta_summary.csv","attribution_beta_summary.csv")
+  # X_oof + beta_draws for downstream re-aggregation.
+  if (!is.null(res$attr_inputs) && length(res$attr_inputs) > 0) {
+    saveRDS(res$attr_inputs, file.path(by_mod, "attribution_inputs.rds"))
+    if (is_best)
+      saveRDS(res$attr_inputs, file.path(base, "attribution_inputs.rds"))
+  }
+  # Per-origin fold diagnostics and fixed-effect stability.
+  write_pair(res$fold_diag,      "fold_diagnostics.csv",     "fold_diagnostics.csv")
+  write_pair(res$beta_stability, "beta_stability.csv",       "beta_stability.csv")
+
+  # Full results RDS (single file per model).
+  saveRDS(res, file.path(by_mod, "temporal_cv_results.rds"))
+  if (is_best)
+    saveRDS(res, file.path(base, "temporal_cv_results.rds"))
+}
+```
+
+## Wave selection
+
+```{r waves}
+ALL_WAVES <- c("NY_wave1", "NY_wave2", "NY_wave3",
+               "UT_wave1", "UT_wave2", "UT_wave3")
+run_waves <- if (params$run_waves == "all") {
+  ALL_WAVES
+} else if (params$run_waves %in% c("NY","UT")) {
+  ALL_WAVES[grepl(params$run_waves, ALL_WAVES)]
+} else if (params$run_waves %in% ALL_WAVES) {
+  params$run_waves
+} else {
+  ALL_WAVES
+}
+```
+
+## Main loop
+
+```{r main}
+all_cv <- list()
+
+for (w in run_waves) {
+  t_wave <- Sys.time()
+  log_msg(sprintf("========== [%s] starting Tier-A+B CV ==========", w))
+
+  wv  <- load_wave_for_cv(w)
+  md  <- wv$md
+  out_dir    <- wv$out_dir
+  cv_dir     <- file.path(out_dir, "validation")
+  dir.create(cv_dir, recursive = TRUE, showWarnings = FALSE)
+
+  best_mn       <- BEST_MODEL_BY_WAVE[[w]]
+  log_msg(sprintf("[%s] best=%s | n_grids=%d n_days=%d",
+                  w, best_mn, md$n_grids, md$n_days))
+
+  # NY uses MODZCTA aggregation as a side product of the cell-level fits;
+  # UT's grid IS the county (audit confirms grid_eq_geo=TRUE), so no
+  # additional aggregation layer is needed.
+  geo_vec <- if (wv$state == "NY") as.character(md$df$geo_id) else NULL
+  cv_step <- if (wv$state == "UT") CV_STEP_UT else CV_STEP_NY
+
+  # Skip if outputs already present for this wave's best model.
+  by_mod_dir <- file.path(cv_dir, "by_model", best_mn)
+  rds_done   <- file.exists(file.path(by_mod_dir, "temporal_cv_results.rds"))
+  if (rds_done) {
+    log_msg(sprintf("  [%s | %s] RESUME: by_model/%s/temporal_cv_results.rds present",
+                    w, best_mn, best_mn))
+    res <- readRDS(file.path(by_mod_dir, "temporal_cv_results.rds"))
+  } else {
+    ws_theta <- NULL
+    ws_file  <- file.path(out_dir, "tables", "ckpt", paste0(best_mn, "_mode.rds"))
+    if (file.exists(ws_file)) {
+      ws_obj <- tryCatch(readRDS(ws_file), error = function(e) NULL)
+      if (is.numeric(ws_obj) && length(ws_obj) > 0) ws_theta <- ws_obj
+      else if (!is.null(ws_obj$theta)) ws_theta <- ws_obj$theta
+      if (!is.null(ws_theta))
+        log_msg(sprintf("    [%s | %s] warmstart: %d hyperparameters",
+                        w, best_mn, length(ws_theta)))
+    } else {
+      log_msg(sprintf("    [%s | %s] no warmstart file; cold start", w, best_mn))
+    }
+
+    t_mod <- Sys.time()
+    res <- run_temporal_cv(md, w, best_mn,
+                            step = cv_step,
+                            warmstart_theta = ws_theta,
+                            ckpt_dir = file.path(by_mod_dir, "ckpt"),
+                            geo_id_vec = geo_vec)
+    if (is.null(res)) {
+      log_msg(sprintf("  [%s | %s] !!! returned NULL", w, best_mn)); next
+    }
+    save_cv_outputs(w, best_mn, res, is_best = TRUE)
+    log_msg(sprintf("  [%s | %s] done in %.1f min",
+                    w, best_mn,
+                    as.numeric(difftime(Sys.time(), t_mod, units = "mins"))))
+  }
+
+  all_cv[[w]] <- list(state = wv$state, wave_id = wv$wave_id, label = w,
+                      best_model = best_mn, results = list2env(setNames(list(res), best_mn)))
+  # store as plain list for downstream consumers
+  all_cv[[w]]$results <- setNames(list(res), best_mn)
+  saveRDS(all_cv[[w]], file.path(cv_dir, "cv_state.rds"))
+
+  log_msg(sprintf("========== [%s] DONE in %.1f min ==========\n",
+                  w, as.numeric(difftime(Sys.time(), t_wave, units = "mins"))))
+  rm(md, wv, res); gc(full = TRUE)
+}
+```
+
+## Cross-wave summary
+
+```{r cross_wave, results='asis'}
+cross_dir <- file.path(CONFIG$output_dir, "_cross_wave")
+dir.create(cross_dir, recursive = TRUE, showWarnings = FALSE)
+
+rows <- lapply(run_waves, function(w) {
+  rv <- all_cv[[w]]; if (is.null(rv)) return(NULL)
+  mn <- rv$best_model; cs <- rv$results[[mn]]$cell_scores
+  ms <- rv$results[[mn]]$modz_scores
+  data.table(wave = w, model = mn,
+             CRPS = cs$CRPS, logS = cs$logS, RMSE = cs$RMSE,
+             R2 = cs$R2, Cov95 = cs$Cov95,
+             Cov95_NB_daily = cs$Cov95_NB_daily,
+             daily_RMSE = cs$daily_RMSE, daily_relRMSE = cs$daily_relRMSE,
+             modz_total_R2    = if (!is.null(ms)) ms$modzcta_total_R2    else NA_real_,
+             modz_total_MdAPE = if (!is.null(ms)) ms$modzcta_total_MdAPE else NA_real_,
+             modz_total_Cov95 = if (!is.null(ms)) ms$modzcta_total_Cov95 else NA_real_)
+})
+summary_all <- rbindlist(rows, fill = TRUE)
+if (nrow(summary_all) > 0) {
+  fwrite(summary_all, file.path(cross_dir, "temporal_cv_summary_all.csv"))
+  print(kable(summary_all, digits = 4,
+              caption = "Temporal CV scores — WAIC-best model per wave (cell-level scores: outlier_mode = 'all')"))
+}
+
+# Outlier-trimmed companion: one row per wave×outlier_mode so reviewers see
+# how much of the cell-level cost is driven by the predictive-tail outliers.
+mode_rows <- lapply(run_waves, function(w) {
+  rv <- all_cv[[w]]; if (is.null(rv)) return(NULL)
+  mn <- rv$best_model; bm <- rv$results[[mn]]$cell_scores_by_mode
+  if (is.null(bm) || nrow(bm) == 0) return(NULL)
+  bm[, .(wave = w, model = mn, outlier_mode,
+         pct_outlier = round(100 * pct_outlier, 3),
+         RMSE, MAE, R2, CRPS, Cov50, Cov80, Cov95, logS)]
+})
+summary_by_mode <- rbindlist(mode_rows, fill = TRUE)
+if (nrow(summary_by_mode) > 0) {
+  fwrite(summary_by_mode, file.path(cross_dir, "temporal_cv_summary_by_mode.csv"))
+  print(kable(summary_by_mode, digits = 4,
+              caption = "Temporal CV scores — full vs trimmed (predictive-tail outliers masked from scoring only)"))
+}
+```
+
+## Forecast trajectories
+
+```{r trajectories, fig.width=14, fig.height=10}
+fig_dir <- file.path(CONFIG$output_dir, "figures")
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+
+panels <- list()
+for (w in run_waves) {
+  rv <- all_cv[[w]]; if (is.null(rv)) next
+  mn <- rv$best_model
+  d <- rv$results[[mn]]$daily_agg
+  if (is.null(d) || nrow(d) < 2) next
+  rmse_v <- rv$results[[mn]]$cell_scores$RMSE
+  panels[[w]] <- ggplot(d, aes(time_id)) +
+    geom_ribbon(aes(ymin = lo, ymax = hi), fill = "steelblue", alpha = 0.3) +
+    geom_line(aes(y = pred), color = "steelblue", linewidth = 1) +
+    geom_point(aes(y = obs), color = "red", size = 2) +
+    labs(title = sprintf("%s\n%s | RMSE=%.1f", w, mn, rmse_v),
+         x = "Day", y = "Daily cases") +
+    theme_minimal(base_size = 9) +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 9))
+}
+
+if (length(panels) > 0) {
+  p_traj <- wrap_plots(panels, ncol = 2) +
+    plot_annotation(title = "Temporal Forward CV — Forecast Trajectories",
+                    subtitle = "Blue ribbon: 95% PI (uncalibrated). Red: observed daily totals.",
+                    theme = theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 13),
+                                  plot.subtitle = element_text(hjust = 0.5, color = "grey40")))
+  ggsave(file.path(fig_dir, "cv_temporal_trajectories.png"),
+         p_traj, width = 14, height = max(5, 3 * ceiling(length(panels)/2)), dpi = 150)
+  print(p_traj)
+}
+```
+
+## MODZCTA scatter (NY only)
+
+```{r modz_scatter, fig.width=14, fig.height=10}
+wave_labels <- c(NY_wave1 = "Wave 1: Mar–May 2020",
+                 NY_wave2 = "Wave 2: Dec 2020–Feb 2021",
+                 NY_wave3 = "Wave 3: Dec 2021–Feb 2022")
+
+modz_panels <- list()
+for (w in intersect(run_waves, names(wave_labels))) {
+  rv <- all_cv[[w]]; if (is.null(rv)) next
+  mn <- rv$best_model
+  mt <- rv$results[[mn]]$modz_totals
+  if (is.null(mt) || nrow(mt) < 3) next
+  modz_panels[[w]] <- ggplot(mt, aes(obs_total, pred_total)) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey50") +
+    geom_point(alpha = 0.5, size = 1.5) +
+    geom_smooth(method = "lm", se = TRUE, colour = "red", linewidth = 0.6) +
+    scale_x_log10() + scale_y_log10() +
+    labs(title = sprintf("%s | %s", wave_labels[[w]], mn),
+         x = "Obs total", y = "Pred total") +
+    theme_minimal(base_size = 10)
+}
+if (length(modz_panels) > 0) {
+  p <- wrap_plots(modz_panels, ncol = 2) +
+    plot_annotation(title = "MODZCTA Total-Case CV: Obs vs Pred",
+                    theme = theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 13)))
+  tryCatch({
+    tex_fig_dir <- here::here("thesis_latex", "figures")
+    dir.create(tex_fig_dir, recursive = TRUE, showWarnings = FALSE)
+    ggsave(file.path(tex_fig_dir, "ny_modzcta_temporal_cv_scatter.png"),
+           p, width = 14, height = max(5, 3 * ceiling(length(modz_panels)/2)), dpi = 300)
+  }, error = function(e) message("thesis_latex copy skipped: ", conditionMessage(e)))
+  print(p)
+}
+```
+
+## Notes for downstream consumers
+
+* Validation outputs are saved under both `validation/by_model/<model>/`
+  and, for the WAIC-best model, the wave-level `validation/` folder.
+* Cross-wave summary is written to `_cross_wave/temporal_cv_summary_all.csv`.
+* CPO is computed on the training half and reported in `fold_diag`; PIT is
+  derived from the rolling-origin holdouts.

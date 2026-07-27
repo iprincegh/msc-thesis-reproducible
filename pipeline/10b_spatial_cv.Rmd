@@ -1,0 +1,642 @@
+---
+title: "11b – Spatial Cross-Validation"
+subtitle: "Area-level leave-fold-out spatial CV (per-wave best model by WAIC)"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+params:
+  run_waves: "all"
+---
+
+```{r setup, include=FALSE}
+source(here::here("helpers/_utils.R"))
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 12, fig.height = 8)
+```
+
+## Setup
+
+```{r load}
+suppressPackageStartupMessages({
+  library(data.table)
+  library(INLA)
+  library(sf)
+  library(spdep)
+  library(ggplot2)
+  library(patchwork)
+  library(viridis)
+  library(scales)
+  library(knitr)
+})
+
+Sys.unsetenv("MallocStackLogging")
+# Threading and solver selection affect runtime only.
+# CV_NUM_THREADS overrides INLA thread config; FIT_USE_PARDISO=1 enables Pardiso.
+.cv_nthr <- Sys.getenv("CV_NUM_THREADS", "1:4")
+inla.setOption(num.threads = .cv_nthr)
+inla.setOption(inla.mode = "compact")
+.pardiso_env <- tolower(Sys.getenv("FIT_USE_PARDISO", ""))
+if (!.pardiso_env %in% c("", "0", "false", "no", "off")) {
+  inla.setOption(smtp = "pardiso")
+  .pchk <- tryCatch(capture.output(INLA::inla.pardiso.check()),
+                    error = function(e) conditionMessage(e))
+  message("[10b] PARDISO enabled | num.threads=", .cv_nthr,
+          " | inla.pardiso.check: ", paste(.pchk, collapse = " "))
+} else {
+  inla.setOption(smtp = "taucs")
+  message("[10b] PARDISO disabled (FIT_USE_PARDISO='", .pardiso_env,
+          "') | smtp=taucs | num.threads=", .cv_nthr)
+}
+
+# Outlier quantile for holdout scoring only.
+options(cv_outlier_q = 0.999)
+
+# Posterior draws for out-of-fold mobility attribution.
+options(cv_posterior_draws = 200L)
+
+source(here::here("helpers/_adjacency.R"))
+source(here::here("helpers/_cv_helpers.R"))
+load_pipeline()
+
+# Timestamped progress log.
+log_msg <- function(...) {
+  msg <- paste0(sprintf("[%s] ", format(Sys.time(), "%H:%M:%S")),
+                paste0(c(...), collapse = ""))
+  cat(msg, "\n", sep = "")
+  flush.console()
+  side <- Sys.getenv("CV_SIDE_LOG", "")
+  if (nzchar(side)) cat(msg, "\n", file = side, append = TRUE, sep = "")
+}
+```
+
+## Spatial CV Function
+
+```{r spatial_cv_fn}
+run_area_spatial_cv <- function(md, folds_dt, wave_label, warmstart_theta = NULL,
+                                model_name = NULL,
+                                n_attr_draws = getOption("cv_posterior_draws", 200L),
+                                ckpt_dir = NULL) {
+  if (is.null(model_name)) model_name <- md$best_model %||% "NLMob_ST_IV"
+  fm <- md$fms[[model_name]]
+  if (is.null(fm)) return(NULL)
+  # Per-fold checkpoint dir; resume completed folds from saved RDS files.
+  if (!is.null(ckpt_dir)) dir.create(ckpt_dir, recursive = TRUE, showWarnings = FALSE)
+
+  # Exclude structurally-zero geo_ids from holdout when possible; keep them in training.
+  # Apply only if the filtered fold set remains valid.
+  if ("geo_id" %in% names(md$df)) {
+    df_geos    <- unique(as.character(md$df$geo_id))
+    total_geos <- length(df_geos)
+    eval_geos  <- compute_eval_units(md$df, unit_col = "geo_id", y_col = "Y")
+    fold_areas <- unique(as.character(folds_dt$area_id))
+    overlap    <- intersect(fold_areas, df_geos)
+    if (length(overlap) == 0L) {
+      log_msg(sprintf("  [%s] WARNING: folds_dt$area_id and md$df$geo_id share no values; skipping sparse-unit filter",
+                      wave_label))
+    } else if (length(eval_geos) > 0L && length(eval_geos) < total_geos) {
+      cand_folds <- folds_dt[as.character(area_id) %in% eval_geos]
+      if (nrow(cand_folds) > 0L && length(unique(cand_folds$cv_fold)) > 0L) {
+        folds_dt <- cand_folds
+        log_msg(sprintf("  [%s] eval-eligible geo_ids: %d / %d (sparse units kept in training, not scored)",
+                        wave_label, length(eval_geos), total_geos))
+      } else {
+        log_msg(sprintf("  [%s] WARNING: sparse-unit filter would leave 0 folds; skipping filter",
+                        wave_label))
+      }
+    }
+  }
+
+  if (nrow(folds_dt) == 0L) {
+    log_msg(sprintf("  [%s] ERROR: no folds remain after filter; aborting CV for this wave", wave_label))
+    return(NULL)
+  }
+  n_folds      <- max(folds_dt$cv_fold, na.rm = TRUE)
+  if (!is.finite(n_folds) || n_folds < 1L) {
+    log_msg(sprintf("  [%s] ERROR: n_folds=%s (non-finite); aborting CV", wave_label, n_folds))
+    return(NULL)
+  }
+  fold_results <- list()
+  attr_cells   <- list()   # Per-cell counterfactual attribution results
+  attr_pcatm   <- list()   # Per-fold PCAtM attribution summary
+  attr_betas   <- list()   # Per-fold mobility coefficient summaries
+  attr_inputs  <- list()   # Per-fold attribution inputs for re-aggregation
+  fold_diag    <- list()   # Per-fold diagnostics (theta, family, dispersion)
+  beta_stab    <- list()   # Per-fold full fixed-effect coefficient summaries
+  total_runtime <- 0
+  # Sequential warmstart: each successful fold seeds the next.
+  current_warm <- warmstart_theta
+
+  for (k in seq_len(n_folds)) {
+    held_areas <- folds_dt[cv_fold == k, unique(area_id)]
+    if (length(held_areas) == 0) next
+
+    holdout_idx <- which(as.character(md$df$geo_id) %in% held_areas)
+    if (length(holdout_idx) == 0) next
+
+    # Resume fold from checkpoint if available.
+    ckpt_f <- if (!is.null(ckpt_dir))
+      file.path(ckpt_dir, sprintf("fold%03d.rds", k)) else NULL
+    if (!is.null(ckpt_f) && file.exists(ckpt_f)) {
+      cp <- tryCatch(readRDS(ckpt_f), error = function(e) NULL)
+      if (!is.null(cp) && is.list(cp) && !is.null(cp$fold_result)) {
+        fold_results[[k]] <- cp$fold_result
+        if (!is.null(cp$attr_cells))  attr_cells[[as.character(k)]]  <- cp$attr_cells
+        if (!is.null(cp$attr_pcatm))  attr_pcatm[[as.character(k)]]  <- cp$attr_pcatm
+        if (!is.null(cp$attr_betas))  attr_betas[[as.character(k)]]  <- cp$attr_betas
+        if (!is.null(cp$attr_inputs)) attr_inputs[[as.character(k)]] <- cp$attr_inputs
+        if (!is.null(cp$fold_diag))   fold_diag[[as.character(k)]]   <- cp$fold_diag
+        if (!is.null(cp$beta_stab))   beta_stab[[as.character(k)]]   <- cp$beta_stab
+        # Adopt resumed theta only when its length matches current warmstart.
+        if (!is.null(cp$theta) && is.numeric(cp$theta) &&
+            (is.null(current_warm) || length(cp$theta) == length(current_warm))) {
+          current_warm <- cp$theta
+        }
+        if (!is.null(cp$runtime) && is.numeric(cp$runtime))
+          total_runtime <- total_runtime + cp$runtime
+        log_msg(sprintf("    [%s | %s] fold %d/%d: RESUME ckpt",
+                        wave_label, model_name, k, n_folds))
+        next
+      }
+    }
+
+    hf <- fit_holdout(md, fm, holdout_idx,
+                      label = sprintf("%s [spatial fold %d/%d] %s", model_name, k, n_folds, wave_label),
+                      warmstart_theta = current_warm,
+                      model_name = model_name,
+                      n_attr_draws = n_attr_draws,
+                      # Disable per-fold LCPO to save INLA time; spatial CV uses held-out CRPS/Cov95.
+                      compute_cpo = FALSE)
+    if (!hf$ok) {
+      fold_results[[k]] <- data.table(fold = k, status = "FAILED")
+      gc(full = TRUE); next
+    }
+    total_runtime <- total_runtime + hf$runtime
+    if (!is.null(hf$theta) && is.numeric(hf$theta)) current_warm <- hf$theta
+    nb_size <- hf$nb_size
+
+    # Out-of-fold mobility attribution outputs.
+    if (!is.null(hf$attribution)) {
+      a  <- hf$attribution
+      ce <- copy(a$cell_attr)
+      ce[, `:=`(fold = k,
+                geo_id  = as.character(md$df$geo_id[holdout_idx]),
+                time_id = md$df$idx_temporal[holdout_idx],
+                grid_id = as.character(md$df$grid_id[holdout_idx]))]
+      attr_cells[[as.character(k)]] <- ce
+      ps <- copy(a$pcatm_summary); ps[, fold := k]
+      attr_pcatm[[as.character(k)]] <- ps
+      bs <- copy(a$beta_summary);  bs[, fold := k]
+      attr_betas[[as.character(k)]] <- bs
+      attr_inputs[[as.character(k)]] <- list(
+        fold       = k,
+        mob_covs   = a$mob_covs,
+        X_oof      = a$X_oof,
+        beta_draws = a$beta_draws,
+        geo_id     = as.character(md$df$geo_id[holdout_idx]),
+        time_id    = md$df$idx_temporal[holdout_idx],
+        grid_id    = as.character(md$df$grid_id[holdout_idx]))
+    }
+
+    # Per-fold diagnostics and beta stability.
+    fd_row <- data.table(fold = k,
+                         runtime_min = round(hf$runtime, 1),
+                         n_oof = length(holdout_idx),
+                         n_areas = length(held_areas),
+                         nb_size = nb_size %||% NA_real_,
+                         family = hf$family %||% NA_character_,
+                         pred_disp = { mu_v <- hf$mu[is.finite(hf$mu)]
+                                       if (length(mu_v) > 1)
+                                         var(mu_v) / max(mean(mu_v), 1e-12)
+                                       else NA_real_ })
+    if (!is.null(hf$theta) && is.numeric(hf$theta)) {
+      th <- as.list(hf$theta); names(th) <- paste0("theta_", seq_along(hf$theta))
+      fd_row <- cbind(fd_row, as.data.table(th))
+    }
+    fold_diag[[as.character(k)]] <- fd_row
+    if (!is.null(hf$fixed_full)) {
+      ff <- as.data.table(hf$fixed_full, keep.rownames = "covariate")
+      ff[, fold := k]
+      beta_stab[[as.character(k)]] <- ff
+    }
+
+    # Outlier flag for scoring only; training is unchanged.
+    OUT_Q <- getOption("cv_outlier_q", 0.999)
+    mu_safe <- pmax(hf$mu, 1e-6)
+    if (!is.null(nb_size) && is.finite(nb_size) && nb_size > 0) {
+      q_hi <- qnbinom(OUT_Q, size = nb_size, mu = mu_safe)
+    } else {
+      q_hi <- qpois(OUT_Q, lambda = mu_safe)
+    }
+    is_outlier <- !is.na(hf$y_true) & hf$y_true > q_hi
+    pct_out <- if (length(hf$y_true) > 0) mean(is_outlier, na.rm = TRUE) else 0
+
+    fam <- hf$family %||% "auto"
+    cs_all  <- cv_scores(hf$y_true, hf$mu, hf$sd_fit, nb_size = nb_size, family = fam)
+    cs_all[, `:=`(fold = k, n_areas = length(held_areas),
+                  runtime = round(hf$runtime, 1), status = "OK",
+                  outlier_mode = "all", pct_outlier = pct_out)]
+    keep <- !is_outlier
+    cs_trim <- cv_scores(hf$y_true[keep], hf$mu[keep], hf$sd_fit[keep],
+                         nb_size = nb_size, family = fam)
+    cs_trim[, `:=`(fold = k, n_areas = length(held_areas),
+                   runtime = round(hf$runtime, 1), status = "OK",
+                   outlier_mode = sprintf("trimmed_q%03d", round(1000 * OUT_Q)),
+                   pct_outlier = pct_out)]
+    cell_scores <- rbind(cs_all, cs_trim, fill = TRUE)
+
+    ho_dt <- data.table(
+      geo_id = as.character(md$df$geo_id[holdout_idx]),
+      time_id = hf$time_id,
+      y_true = hf$y_true, mu = hf$mu, sd_fit = hf$sd_fit,
+      pred_var = nb_pred_var(hf$mu, hf$sd_fit, nb_size))
+
+    area_scores_dt <- ho_dt[, .(obs = sum(y_true, na.rm = TRUE),
+                                pred = sum(mu, na.rm = TRUE),
+                                sd = sqrt(sum(pred_var, na.rm = TRUE)),
+                                n_cells = .N, n_days = uniqueN(time_id)),
+                            by = geo_id]
+    area_scores_dt[, `:=`(fold = k,
+                          lo = pmax(pred - 1.96 * sd, 0),
+                          hi = pred + 1.96 * sd,
+                          covered = (obs >= pmax(pred - 1.96 * sd, 0)) &
+                                    (obs <= pred + 1.96 * sd),
+                          abs_err = abs(obs - pred),
+                          pct_err = abs(obs - pred) / pmax(obs, 1) * 100)]
+
+    area_summary <- cv_scores_area(area_scores_dt)
+    area_summary[, `:=`(fold = k, runtime = round(hf$runtime, 1))]
+
+    pred_dt <- ho_dt[, .(geo_id, time_id, y_true, mu, sd_fit, pred_var)]
+    pred_dt[, fold := k]
+
+    # Legacy out-of-fold PCAtM row for existing readers.
+    fe_train      <- hf$fixed
+    mob_covs_fold <- grep("^(mob_lag|exposure_import)", rownames(fe_train), value = TRUE)
+    pcatm_fold    <- NULL
+    if (length(mob_covs_fold) > 0) {
+      x_oof <- as.matrix(as.data.frame(md$df)[holdout_idx, mob_covs_fold, drop = FALSE])
+      x_oof[is.na(x_oof)] <- 0
+      bm <- fe_train[mob_covs_fold, "mean"]
+      bs <- fe_train[mob_covs_fold, "sd"]
+      eta_mob     <- as.numeric(x_oof %*% bm)
+      eta_mob_var <- as.numeric((x_oof^2) %*% (bs^2))
+      # UT_w3 fix: winsorise per-cell eta at the 1%/99% quantiles before exp-link averaging.
+      qlo_eta <- as.numeric(quantile(eta_mob, 0.01, na.rm = TRUE))
+      qhi_eta <- as.numeric(quantile(eta_mob, 0.99, na.rm = TRUE))
+      eta_mob_w99   <- pmin(pmax(eta_mob, qlo_eta), qhi_eta)
+      # Clip eta to [-2,2] and flag degenerate mobility covariates.
+      eta_mob_clip2 <- pmin(pmax(eta_mob, -2), 2)
+      col_vars_oof  <- apply(x_oof, 2L, stats::var, na.rm = TRUE)
+      n_degen_cols  <- sum(col_vars_oof < 1e-6, na.rm = TRUE)
+      degen_frac    <- n_degen_cols / max(ncol(x_oof), 1L)
+      pcatm_fold  <- data.table(
+        fold              = k,
+        n_oof             = length(holdout_idx),
+        n_mob_covs        = length(mob_covs_fold),
+        AMLP_oof          = mean(eta_mob),
+        AMLP_oof_sd       = sqrt(mean(eta_mob_var)),
+        pcatm_oof         = 1 - exp(-mean(eta_mob)),
+        AMLP_oof_w99      = mean(eta_mob_w99),
+        pcatm_oof_w99     = 1 - exp(-mean(eta_mob_w99)),
+        AMLP_oof_clip2    = mean(eta_mob_clip2),
+        pcatm_oof_clip2   = 1 - exp(-mean(eta_mob_clip2)),
+        eta_extreme_frac  = mean(abs(eta_mob) > 1, na.rm = TRUE),
+        n_degen_cols      = n_degen_cols,
+        degen_frac        = degen_frac,
+        is_degenerate     = degen_frac > 0.50,
+        pct_pos           = 100 * mean(eta_mob > 0))
+    }
+
+    fold_results[[k]] <- list(cell_scores = cell_scores,
+                              area_scores = area_summary,
+                              area_detail = area_scores_dt,
+                              predictions = pred_dt,
+                              pcatm_oof   = pcatm_fold)
+
+    # ── ckpt save ───────────────────────────────────────────────────
+    if (!is.null(ckpt_f)) {
+      tryCatch(
+        saveRDS(list(
+          fold_result = fold_results[[k]],
+          attr_cells  = attr_cells[[as.character(k)]],
+          attr_pcatm  = attr_pcatm[[as.character(k)]],
+          attr_betas  = attr_betas[[as.character(k)]],
+          attr_inputs = attr_inputs[[as.character(k)]],
+          fold_diag   = fold_diag[[as.character(k)]],
+          beta_stab   = beta_stab[[as.character(k)]],
+          theta       = current_warm,
+          runtime     = hf$runtime),
+          ckpt_f),
+        error = function(e) log_msg(sprintf("    [%s | %s] fold %d/%d: ckpt save FAILED: %s",
+                                            wave_label, model_name, k, n_folds, conditionMessage(e))))
+    }
+    rm(hf, ho_dt); gc(full = TRUE)
+  }
+
+  valid <- Filter(is.list, fold_results)
+  if (length(valid) == 0) return(NULL)
+
+  cell_all <- rbindlist(lapply(valid, `[[`, "cell_scores"), fill = TRUE)
+  area_all <- rbindlist(lapply(valid, `[[`, "area_scores"), fill = TRUE)
+  detail_all <- rbindlist(lapply(valid, `[[`, "area_detail"), fill = TRUE)
+  pred_all <- rbindlist(lapply(valid, `[[`, "predictions"), fill = TRUE)
+  pcatm_oof_all <- rbindlist(lapply(valid, `[[`, "pcatm_oof"), fill = TRUE)
+
+  # Per-mode cell aggregator (rows: "all" and trimmed_q999).
+  score_cols <- intersect(c("RMSE","MAE","R2","CRPS","Cov50","Cov80","Cov95",
+                            "Cov95_gauss","logS","DSS","cal_intercept",
+                            "cal_slope","pit_W1"), names(cell_all))
+  if ("outlier_mode" %in% names(cell_all)) {
+    cell_avg_by_mode <- cell_all[, c(list(
+        N = sum(N, na.rm = TRUE), n_folds = .N,
+        pct_outlier = mean(pct_outlier, na.rm = TRUE),
+        runtime = round(total_runtime, 1)),
+        lapply(.SD, mean, na.rm = TRUE)),
+      by = outlier_mode, .SDcols = score_cols]
+    cell_avg <- cell_avg_by_mode[outlier_mode == "all"][, outlier_mode := NULL][1]
+  } else {
+    cell_avg_by_mode <- NULL
+    cell_avg <- data.table(
+      RMSE  = mean(cell_all$RMSE, na.rm = TRUE),
+      MAE   = mean(cell_all$MAE,  na.rm = TRUE),
+      R2    = mean(cell_all$R2,   na.rm = TRUE),
+      CRPS  = mean(cell_all$CRPS, na.rm = TRUE),
+      Cov95 = mean(cell_all$Cov95, na.rm = TRUE),
+      N = sum(cell_all$N, na.rm = TRUE),
+      n_folds = length(valid), runtime = round(total_runtime, 1))
+  }
+
+  area_avg <- data.table(
+    area_R2 = mean(area_all$R2, na.rm = TRUE),
+    area_RMSE = mean(area_all$RMSE, na.rm = TRUE),
+    area_MAE = mean(area_all$MAE, na.rm = TRUE),
+    area_MdAPE = median(detail_all$pct_err, na.rm = TRUE),
+    area_Cov95 = mean(detail_all$covered, na.rm = TRUE),
+    area_Corr = cor(detail_all$obs, detail_all$pred))
+
+  # Per-area cell-day scores by held-out fold using the fold-specific family.
+  per_area_scores <- NULL
+  if (!is.null(pred_all) && nrow(pred_all) > 0 && length(fold_diag) > 0) {
+    fd_dt <- rbindlist(fold_diag, fill = TRUE)
+    fam_lkp <- fd_dt[, .(fold, nb_size, family)]
+    pa <- merge(pred_all, fam_lkp, by = "fold", all.x = TRUE)
+    per_area_scores <- pa[, {
+      nb <- nb_size[1]; fm_i <- family[1] %||% "auto"
+      sc <- cv_scores(y_true, mu, sd_fit,
+                      nb_size = if (!is.null(nb) && is.finite(nb)) nb else NULL,
+                      family  = if (is.na(fm_i)) "auto" else fm_i)
+      c(list(fold = fold[1], n_cell_days = .N,
+             n_days = uniqueN(time_id)), as.list(sc))
+    }, by = geo_id]
+    setcolorder(per_area_scores, c("geo_id", "fold", "n_cell_days", "n_days"))
+  }
+
+  list(cell_avg = cell_avg, cell_avg_by_mode = cell_avg_by_mode,
+       area_avg = area_avg,
+       cell_folds = cell_all, area_folds = area_all,
+       area_detail = detail_all, predictions = pred_all,
+       per_area_scores = per_area_scores,
+       pcatm_oof = pcatm_oof_all,
+       # Attribution and diagnostics.
+       attr_cells  = if (length(attr_cells) > 0) rbindlist(attr_cells, fill=TRUE) else NULL,
+       attr_pcatm  = if (length(attr_pcatm) > 0) rbindlist(attr_pcatm, fill=TRUE) else NULL,
+       attr_betas  = if (length(attr_betas) > 0) rbindlist(attr_betas, fill=TRUE) else NULL,
+       attr_inputs = attr_inputs,
+       fold_diag   = if (length(fold_diag)  > 0) rbindlist(fold_diag,  fill=TRUE) else NULL,
+       beta_stability = if (length(beta_stab) > 0) rbindlist(beta_stab, fill=TRUE) else NULL)
+}
+```
+
+## Wave Selection
+
+```{r wave_selection}
+ALL_WAVES <- c("NY_wave1", "NY_wave2", "NY_wave3", "UT_wave1", "UT_wave2", "UT_wave3")
+
+run_waves <- if (params$run_waves == "all") {
+  ALL_WAVES
+} else if (params$run_waves %in% c("NY", "UT")) {
+  ALL_WAVES[grepl(params$run_waves, ALL_WAVES)]
+} else if (params$run_waves %in% ALL_WAVES) {
+  params$run_waves
+} else {
+  ALL_WAVES
+}
+```
+
+## Main Pipeline
+
+```{r pipeline}
+all_spatial <- list()
+
+for (w in run_waves) {
+  wv <- load_wave_for_cv(w)
+  md <- wv$md; out_dir <- wv$out_dir
+  cv_out_dir <- file.path(out_dir, "validation")
+  dir.create(cv_out_dir, recursive = TRUE, showWarnings = FALSE)
+
+  # ── Best model: hard-coded per wave in BEST_MODEL_BY_WAVE (helpers/_cv_helpers.R)
+  best_mn   <- wv$best_model
+  best_waic <- wv$model_results$best_model
+  log_msg(sprintf("[%s] using best model: %s (WAIC-best on file: %s)",
+                  w, best_mn, ifelse(is.null(best_waic), "NA", best_waic)))
+  if (!is.null(best_waic) && best_waic != best_mn)
+    log_msg(sprintf("[%s] WARNING: hard-coded best (%s) differs from on-disk best (%s)",
+                    w, best_mn, best_waic))
+
+  # Warmstart from full posterior mode saved by 09_fit_model for the best model.
+  ws_theta <- NULL
+  ws_file  <- file.path(out_dir, "tables", "ckpt", paste0(best_mn, "_mode.rds"))
+  if (file.exists(ws_file)) {
+    ws_obj <- tryCatch(readRDS(ws_file), error = function(e) NULL)
+    if (is.numeric(ws_obj) && length(ws_obj) > 0) ws_theta <- ws_obj
+    else if (!is.null(ws_obj$theta)) ws_theta <- ws_obj$theta
+    if (!is.null(ws_theta)) log_msg("    [warmstart] loaded \u03b8 (",
+                                    length(ws_theta), " hyperparameters) for ", w)
+  }
+
+  fld <- create_area_folds(md$df, md$grid_sf, wv$state)
+  ckpt_dir_w <- file.path(cv_out_dir, "by_model", best_mn, "ckpt_folds")
+  scv <- run_area_spatial_cv(md, fld$fold_dt, w, warmstart_theta = ws_theta,
+                             model_name = best_mn,
+                             ckpt_dir = ckpt_dir_w)
+
+  if (!is.null(scv)) {
+    scv$state <- wv$state
+    scv$wave  <- w
+    scv$folds <- fld$fold_dt
+  }
+
+  all_spatial[[w]] <- scv
+  rm(md, wv); gc(full = TRUE)
+}
+```
+
+## Results
+
+### Cell-Level Scores by Fold
+
+```{r cell_results, results='asis'}
+cell_rows <- rbindlist(lapply(names(all_spatial), function(nm) {
+  rv <- all_spatial[[nm]]
+  if (is.null(rv)) return(NULL)
+  s <- copy(rv$cell_avg)
+  s[, wave := nm]; s
+}), fill = TRUE)
+
+if (nrow(cell_rows) > 0) {
+  print(kable(cell_rows[, .(wave, RMSE = round(RMSE, 3), MAE = round(MAE, 3),
+                             R2 = round(R2, 3), CRPS = round(CRPS, 4),
+                             Cov95 = round(Cov95, 3), n_folds, runtime)],
+              format = "pipe",
+              caption = "Spatial CV -- Cell-level average scores across folds"))
+}
+```
+
+### Area-Level Scores
+
+```{r area_results, results='asis'}
+area_rows <- rbindlist(lapply(names(all_spatial), function(nm) {
+  rv <- all_spatial[[nm]]
+  if (is.null(rv)) return(NULL)
+  s <- copy(rv$area_avg)
+  s[, wave := nm]; s
+}), fill = TRUE)
+
+if (nrow(area_rows) > 0) {
+  print(kable(area_rows[, .(wave, R2 = round(area_R2, 3),
+                             RMSE = round(area_RMSE, 1),
+                             MAE = round(area_MAE, 1),
+                             MdAPE = round(area_MdAPE, 1),
+                             Cov95 = round(area_Cov95, 3),
+                             Corr = round(area_Corr, 3))],
+              format = "pipe",
+              caption = "Spatial CV -- Area-level aggregate scores"))
+}
+```
+
+### Area Scatter Plots
+
+```{r area_scatter, fig.width=14, fig.height=10}
+wave_labels <- c(NY_wave1 = "Wave 1: Mar-May 2020",
+                 NY_wave2 = "Wave 2: Dec 2020-Feb 2021",
+                 NY_wave3 = "Wave 3: Dec 2021-Feb 2022",
+                 UT_wave1 = "Wave 1", UT_wave2 = "Wave 2", UT_wave3 = "Wave 3")
+
+scatter_panels <- list()
+for (nm in names(all_spatial)) {
+  rv <- all_spatial[[nm]]
+  if (is.null(rv)) next
+
+  area_dt <- rv$area_detail
+  lbl <- ifelse(!is.null(wave_labels[nm]), wave_labels[nm], nm)
+  r2 <- round(rv$area_avg$area_R2, 3)
+  cov <- round(rv$area_avg$area_Cov95 * 100, 1)
+
+  scatter_panels[[nm]] <- ggplot(area_dt, aes(obs, pred)) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey50") +
+    geom_errorbar(aes(ymin = lo, ymax = hi), alpha = 0.2, width = 0, colour = "steelblue") +
+    geom_point(alpha = 0.6, size = 2) +
+    geom_smooth(method = "lm", se = FALSE, colour = "red", linewidth = 0.8) +
+    labs(title = sprintf("%s | R²=%.3f | Cov95=%.1f%%", lbl, r2, cov),
+         x = "Observed total cases", y = "Predicted total cases") +
+    theme_minimal() +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 10))
+}
+
+if (length(scatter_panels) > 0) {
+  p <- wrap_plots(scatter_panels, ncol = 3) +
+    plot_annotation(
+      title = "Spatial CV -- Observed vs Predicted Area Totals",
+      subtitle = "MODZCTA (NYC) / County LOCO (Utah) | red line = OLS fit | grey dashed = 1:1",
+      theme = theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 14),
+                    plot.subtitle = element_text(hjust = 0.5, color = "grey40")))
+  print(p)
+}
+```
+
+### Comparison with Temporal CV
+
+```{r comparison, results='asis'}
+fig_dir <- file.path(CONFIG$output_dir, "figures")
+tcv_file <- file.path(fig_dir, "cv_temporal_summary_all.csv")
+
+if (file.exists(tcv_file) && nrow(cell_rows) > 0) {
+  tcv_summary <- fread(tcv_file)
+  tcv_h3 <- tcv_summary[horizon == 3, .(wave, RMSE_temporal = RMSE, R2_temporal = R2,
+                                          CRPS_temporal = CRPS, Cov95_temporal = Cov95)]
+
+  spatial_summary <- cell_rows[, .(wave, RMSE_spatial = RMSE, R2_spatial = R2,
+                                    CRPS_spatial = CRPS, Cov95_spatial = Cov95)]
+
+  merged <- merge(spatial_summary, tcv_h3, by = "wave", all = TRUE)
+  merged[, `:=`(RMSE_spatial = round(RMSE_spatial, 3), RMSE_temporal = round(RMSE_temporal, 3),
+                R2_spatial = round(R2_spatial, 3), R2_temporal = round(R2_temporal, 3),
+                CRPS_spatial = round(CRPS_spatial, 4), CRPS_temporal = round(CRPS_temporal, 4),
+                Cov95_spatial = round(Cov95_spatial, 3), Cov95_temporal = round(Cov95_temporal, 3))]
+
+  print(kable(merged, format = "pipe",
+              caption = "Spatial vs Temporal CV (h=3) -- Cell-level Score Comparison"))
+}
+```
+
+## Save Results
+
+```{r save}
+fig_dir <- file.path(CONFIG$output_dir, "figures")
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+
+for (nm in names(all_spatial)) {
+  rv <- all_spatial[[nm]]
+  if (is.null(rv)) next
+
+  cv_out_dir <- file.path(CONFIG$output_dir, nm, "validation")
+  dir.create(cv_out_dir, recursive = TRUE, showWarnings = FALSE)
+
+  saveRDS(rv, file.path(cv_out_dir, "spatial_cv_area_results.rds"))
+  fwrite(rv$cell_folds, file.path(cv_out_dir, "spatial_cv_area_cell_scores.csv"))
+  fwrite(rv$area_folds, file.path(cv_out_dir, "spatial_cv_area_scores.csv"))
+  fwrite(rv$area_detail, file.path(cv_out_dir, "spatial_cv_area_detail.csv"))
+  fwrite(rv$predictions, file.path(cv_out_dir, "spatial_cv_area_predictions.csv"))
+  if (!is.null(rv$per_area_scores) && nrow(rv$per_area_scores) > 0) {
+    fwrite(rv$per_area_scores,
+           file.path(cv_out_dir, "spatial_cv_per_area_scores.csv"))
+  }
+  if (!is.null(rv$pcatm_oof) && nrow(rv$pcatm_oof) > 0) {
+    fwrite(rv$pcatm_oof, file.path(cv_out_dir, "pcatm_oof.csv"))
+  }
+  # Attribution and diagnostic outputs.
+  if (!is.null(rv$attr_cells)  && nrow(rv$attr_cells)  > 0)
+    fwrite(rv$attr_cells,  file.path(cv_out_dir, "attribution_cell_long.csv"))
+  if (!is.null(rv$attr_pcatm)  && nrow(rv$attr_pcatm)  > 0)
+    fwrite(rv$attr_pcatm,  file.path(cv_out_dir, "attribution_pcatm.csv"))
+  if (!is.null(rv$attr_betas)  && nrow(rv$attr_betas)  > 0)
+    fwrite(rv$attr_betas,  file.path(cv_out_dir, "attribution_beta_summary.csv"))
+  if (!is.null(rv$attr_inputs) && length(rv$attr_inputs) > 0)
+    saveRDS(rv$attr_inputs, file.path(cv_out_dir, "attribution_inputs.rds"))
+  if (!is.null(rv$fold_diag)   && nrow(rv$fold_diag)   > 0)
+    fwrite(rv$fold_diag,   file.path(cv_out_dir, "fold_diagnostics.csv"))
+  if (!is.null(rv$beta_stability) && nrow(rv$beta_stability) > 0)
+    fwrite(rv$beta_stability, file.path(cv_out_dir, "beta_stability.csv"))
+}
+
+if (nrow(cell_rows) > 0) fwrite(cell_rows, file.path(fig_dir, "cv_spatial_summary_all.csv"))
+
+if (length(scatter_panels) > 0) {
+  p_scatter <- wrap_plots(scatter_panels, ncol = 3) +
+    plot_annotation(
+      title = "Spatial CV -- Observed vs Predicted Area Totals (per-wave best model)",
+      theme = theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 14)))
+  ggsave(file.path(fig_dir, "cv_spatial_scatter_all.png"), p_scatter,
+         width = 14, height = ceiling(length(scatter_panels) / 3) * 5, dpi = 150)
+  tryCatch({
+    tex_fig_dir <- file.path("thesis_latex", "figures")
+    dir.create(tex_fig_dir, recursive = TRUE, showWarnings = FALSE)
+    ggsave(file.path(tex_fig_dir, "spatial_cv_scatter.png"), p_scatter,
+           width = 14, height = ceiling(length(scatter_panels) / 3) * 5, dpi = 300)
+  }, error = function(e) message("thesis_latex copy skipped: ", conditionMessage(e)))
+}
+```

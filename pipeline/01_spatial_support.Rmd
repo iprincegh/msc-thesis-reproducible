@@ -1,0 +1,163 @@
+---
+title: "01 - Spatial Support: 100m Grid Creation (NYC)"
+author: "Prince Oppong Boakye"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+---
+
+# Spatial Support: 100m Grid Creation
+
+Creates the time-invariant spatial mesh $\mathcal{G}$ — a regular 100 m grid over the
+study area — plus the queen-contiguity neighbourhood structure $\mathbf{W}$
+required by the BYM2 component.
+
+**Outputs:** `grid_100m_{state}.gpkg`, `grid_nb_{state}.rds`, `grid_adj_{state}.graph`
+
+```{r setup, include=FALSE}
+source(here::here("helpers/_utils.R"))
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+load_pipeline()
+library(data.table); library(sf); library(spdep); library(INLA)
+library(ggplot2); library(ggspatial)
+```
+
+# Load CBG Boundaries
+
+```{r cbg}
+for (state in CONFIG$states) {
+
+cbg_path <- get_cbg_path(state)
+utm_crs  <- get_utm_crs(state)
+fips_3   <- get_metro_fips(state, 3)
+state_prefix <- get_state_prefix(state)
+
+if (state == "UT") {
+  # --- Utah: County-level spatial units (29 counties) ---
+  # the native resolution of NYT case data (county-day).
+
+  # 1. Load county boundaries
+  counties_sf <- st_read(CONFIG$ut_counties_path, quiet = TRUE)
+  counties_sf <- st_transform(counties_sf, utm_crs)
+  counties_sf$COUNTYFP10 <- sprintf("%03d", as.integer(counties_sf$FIPS))
+  counties_sf$NAME10     <- counties_sf$NAME
+  counties_sf$GEOID10    <- counties_sf$FIPS_STR
+  counties_sf <- counties_sf[counties_sf$COUNTYFP10 %in% fips_3, ]
+  counties_sf <- counties_sf[order(counties_sf$COUNTYFP10), ]
+
+  # 2. Build grid_sf with county polygons as spatial units
+  grid_sf <- st_sf(
+    grid_id     = seq_len(nrow(counties_sf)),
+    county_fips = counties_sf$COUNTYFP10,
+    fips_5      = paste0(state_prefix, counties_sf$COUNTYFP10),
+    cbg_geoid   = NA_character_,
+    county_name = counties_sf$NAME10,
+    geometry    = st_geometry(counties_sf)
+  )
+  cc <- st_coordinates(st_centroid(grid_sf))
+  grid_sf$cent_x <- cc[, 1]
+  grid_sf$cent_y <- cc[, 2]
+
+  for (ci in seq_len(nrow(grid_sf))) {
+  }
+
+  # 3. Queen contiguity from county polygons
+  nb <- poly2nb(grid_sf, queen = TRUE)
+
+  # Fix islands — connect to nearest neighbour
+  island_idx <- which(sapply(nb, length) == 0)
+  if (length(island_idx) > 0) {
+    crd <- cbind(grid_sf$cent_x, grid_sf$cent_y)
+    for (j in island_idx) {
+      d <- sqrt((crd[, 1] - crd[j, 1])^2 + (crd[, 2] - crd[j, 2])^2)
+      d[j] <- Inf
+      nn <- which.min(d)
+      nb[[j]]  <- as.integer(nn)
+      nb[[nn]] <- sort(unique(c(nb[[nn]], as.integer(j))))
+    }
+  }
+
+} else {
+  # --- NYC: 100 m regular grid ---
+  cbg_sf <- st_read(cbg_path, quiet = TRUE)
+  cbg_sf$county_fips_3 <- substr(cbg_sf$GEOID, 3, 5)
+  metro_cbg <- cbg_sf[cbg_sf$county_fips_3 %in% fips_3, ]
+  metro_cbg_proj <- st_transform(metro_cbg, utm_crs)
+
+  # Create 100 m Grid
+  grid <- st_make_grid(metro_cbg_proj, cellsize = CONFIG$grid_size_m, what = "polygons")
+  grid_sf <- st_sf(geometry = grid)
+  grid_sf$grid_id <- seq_len(nrow(grid_sf))
+
+  coords <- st_coordinates(st_centroid(grid_sf))
+  grid_sf$cent_x <- coords[, 1]
+  grid_sf$cent_y <- coords[, 2]
+
+  # Keep cells that intersect the metro area
+  inside <- st_intersects(grid_sf, st_union(metro_cbg_proj), sparse = FALSE)[, 1]
+  grid_sf <- grid_sf[inside, ]
+  grid_sf$grid_id <- seq_len(nrow(grid_sf))
+
+  # Neighbourhood Structure
+  nb <- poly2nb(grid_sf, queen = TRUE)
+
+  # Fix islands — connect to nearest neighbour
+  island_idx <- which(sapply(nb, length) == 0)
+  if (length(island_idx) > 0) {
+    crd <- st_coordinates(st_centroid(grid_sf))
+    for (i in island_idx) {
+      d <- sqrt((crd[, 1] - crd[i, 1])^2 + (crd[, 2] - crd[i, 2])^2)
+      d[i] <- Inf
+      nn <- which.min(d)
+      nb[[i]]  <- as.integer(nn)
+      nb[[nn]] <- unique(c(nb[[nn]], as.integer(i)))
+    }
+  }
+
+  # Assign CBG Attributes
+  cbg_assign <- st_within(st_centroid(grid_sf), metro_cbg_proj, sparse = TRUE)
+  grid_sf$cbg_geoid   <- sapply(cbg_assign, function(x) {
+    if (length(x) > 0) metro_cbg_proj$GEOID[x[1]] else NA_character_
+  })
+  grid_sf$county_fips <- substr(grid_sf$cbg_geoid, 3, 5)
+  grid_sf$fips_5      <- paste0(state_prefix, grid_sf$county_fips)
+}
+
+# --- Save ---
+grid_file  <- file.path(CONFIG$grids_dir, sprintf("grid_100m_%s.gpkg", state))
+nb_file    <- file.path(CONFIG$grids_dir, sprintf("grid_nb_%s.rds", state))
+graph_file <- file.path(CONFIG$grids_dir, sprintf("grid_adj_%s.graph", state))
+
+st_write(grid_sf, grid_file, delete_dsn = TRUE, quiet = TRUE)
+saveRDS(nb, nb_file)
+nb2INLA(graph_file, nb)
+
+# --- Visualization ---
+if (state == "UT") {
+  # UT county-level spatial units
+  print(ggplot() +
+    geom_sf(data = grid_sf, aes(fill = county_name),
+            color = "grey40", linewidth = 0.4) +
+    geom_sf_label(data = grid_sf, aes(label = county_name),
+                  size = 2, fill = alpha("white", 0.7)) +
+    map_extras() +
+    labs(title = sprintf("%s County Spatial Units (%d counties)",
+                         state, nrow(grid_sf))) +
+    theme_map() +
+    theme(legend.position = "none"))
+} else {
+  print(ggplot() +
+    cbg_base_layer(metro_cbg_proj) +
+    geom_sf(data = grid_sf, aes(fill = county_fips), color = NA, alpha = 0.7) +
+    scale_fill_viridis_d(option = "plasma", name = "County") +
+    map_extras() +
+    labs(title = sprintf("%s 100 m Grid (%s cells)", state, fmt(nrow(grid_sf)))) +
+    theme_map())
+}
+
+}
+```

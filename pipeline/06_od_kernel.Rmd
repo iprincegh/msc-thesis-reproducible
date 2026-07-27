@@ -1,0 +1,434 @@
+---
+title: "06 - Origin-Destination Kernel rho(g,t)"
+author: "Prince Oppong Boakye"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+source(here::here("helpers/_utils.R"))
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Overview
+
+Computes contextual infection pressure rho(g,t) from OD mobility flows.
+Each visit is weighted by incubation-weighted origin case rate (lags 1-7 days),
+destination spillover rate, activity weight (visitors x dwell x distance decay),
+and trip chain amplification. Outputs: aggregated rho per grid-day (for INLA)
+and pair-level OD flows (for ABM coupling).
+
+```{r init}
+load_pipeline()
+library(data.table)
+library(sf)
+library(arrow)
+
+# Distance-kernel defaults (used as fallback if MLE fit fails). The fitted
+# values per state-wave are written to the kernel diagnostics table.
+OD_DECAY_M     <- 10000  # sigma (m), default
+OD_DECAY_ALPHA <- 2      # power-law exponent, default (Meyer & Held 2014)
+
+# Reporting-lag-aware incubation weights for COVID-19.
+# Total infection -> case-record delay = 5d incubation + 1d testing + 1d reporting = 7d.
+# Peak weight at t-7 reflects this; lighter mass at t-5..t-6 covers fast reporters
+# and at t-1..t-2 covers known late-onset / repeat-exposure cases.
+# Empirical CCF peaks from stage 04 (UT w2 lag-7, others 14-22d) support the
+# lag-7 mass; longer-lag waves are absorbed by the RW2 temporal smooth in 09.
+INCUBATION_WEIGHTS <- c(`7` = 0.30, `6` = 0.20, `5` = 0.20,
+                        `4` = 0.10, `3` = 0.10, `2` = 0.05, `1` = 0.05)
+
+# Quantile used for robust rho variant (Slater 2025 §5 future-work suggestion).
+ROBUST_RHO_QUANTILE <- 0.5
+```
+
+# Helpers
+
+```{r helpers}
+load_cbg_modzcta_xw <- function(cfg) {
+  rds <- file.path(cfg$cache_dir, "cbg_modzcta_crosswalk_NY.rds")
+  if (file.exists(rds)) return(readRDS(rds))
+  xw <- fread(cfg$nyc_crosswalk_path)
+  xw[, cbg_geoid := as.character(cbg_geoid)]
+  xw[, modzcta := as.character(modzcta)]
+  dir.create(dirname(rds), showWarnings = FALSE, recursive = TRUE)
+  saveRDS(xw, rds)
+  xw
+}
+
+build_cbg_lookup <- function(cfg, state) {
+  if (state == "NY") {
+    xw <- load_cbg_modzcta_xw(cfg)
+    data.table(cbg_geoid = standardize_cbg(xw$cbg_geoid),
+               rate_geo_id = standardize_fips(xw$modzcta))
+  } else {
+    # Utah: county FIPS is first 5 chars of CBG GEOID
+    cbg_sf <- st_read(get_cbg_path(state), quiet = TRUE)
+    cbg_sf <- cbg_sf[substr(cbg_sf$GEOID, 1, 2) == cfg$ut_state_fips, ]
+    data.table(cbg_geoid = standardize_cbg(cbg_sf$GEOID),
+               rate_geo_id = substr(standardize_cbg(cbg_sf$GEOID), 1, 5))
+  }
+}
+
+build_centroids <- function(cfg, state) {
+  utm <- get_utm_crs(state)
+  if (state == "NY") {
+    cbg_sf <- st_read(cfg$ny_cbg_path, quiet = TRUE) |> st_transform(utm)
+    cbg_sf <- cbg_sf[substr(cbg_sf$GEOID, 3, 5) %in% cfg$nyc_fips_3, ]
+    xw <- load_cbg_modzcta_xw(cfg)
+    cbg_sf$modzcta <- standardize_fips(xw$modzcta)[match(standardize_cbg(cbg_sf$GEOID), standardize_cbg(xw$cbg_geoid))]
+    cbg_sf <- cbg_sf[!is.na(cbg_sf$modzcta), ]
+    geo <- cbg_sf |> dplyr::group_by(modzcta) |> dplyr::summarise(geometry = sf::st_union(geometry))
+    cc <- st_coordinates(st_centroid(geo))
+    data.table(geo_id = standardize_fips(geo$modzcta), X = cc[,1], Y = cc[,2])
+  } else {
+    counties <- st_read(cfg$ut_counties_path, quiet = TRUE) |> st_transform(utm)
+    fips_col <- grep("FIPS|fips|GEOID|geoid", names(counties), value = TRUE)[1]
+    cc <- st_coordinates(st_centroid(counties))
+    # UT counties shapefile stores FIPS as bare county code (1-57); case_rates
+    # keys on 5-digit state+county (49xxx). Prepend state FIPS, then pad to 5.
+    raw <- as.character(counties[[fips_col]])
+    raw <- ifelse(nchar(raw) <= 3, paste0(cfg$ut_state_fips, sprintf("%03d", as.integer(raw))), raw)
+    data.table(geo_id = standardize_fips(raw), X = cc[,1], Y = cc[,2])
+  }
+}
+
+spillover_rates <- function(case_day, centroids, phi) {
+  m <- merge(case_day, centroids, by = "geo_id", all = FALSE)
+  if (nrow(m) < 2) { m[, contextual_rate := case_rate]; return(m[, .(geo_id, case_rate, contextual_rate)]) }
+  dm <- as.matrix(dist(as.matrix(m[, .(X, Y)])))
+  sm <- exp(-dm / phi); diag(sm) <- 0
+  m[, contextual_rate := case_rate + as.vector(sm %*% m$case_rate)]
+  m[, .(geo_id, case_rate, contextual_rate)]
+}
+```
+
+# Main Processing
+
+```{r process}
+process_od_kernel <- function(wave_id, wave_months) {
+  out_dir <- get_wave_dir(state, wave_id)
+  rho_file <- file.path(out_dir, "tables", "od_kernel_rho.csv")
+  dr <- get_wave_date_range(wave_months)
+  n_days <- dr$n_days
+  phi <- CONFIG$spillover_phi
+  utm <- get_utm_crs(state)
+
+  case_rates <- fread(file.path(out_dir, "tables", "case_rates.csv"))
+  case_rates[, geo_id := standardize_fips(geo_id)]
+  setkey(case_rates, geo_id, sim_day)
+
+  cbg_lk    <- build_cbg_lookup(CONFIG, state)
+  centroids <- build_centroids(CONFIG, state)
+
+  grid_file <- file.path(out_dir, "intermediate", "grid_visits.feather")
+  grid_dt <- as.data.table(arrow::read_feather(grid_file))
+  grid_dt <- grid_dt[visits_total > 0]
+
+  # map grids to geographic rate units
+  if (!"rate_geo_id" %in% names(grid_dt) || sum(!is.na(grid_dt$rate_geo_id)) == 0) {
+    gsf <- st_read(file.path(CONFIG$grids_dir, sprintf("grid_100m_%s.gpkg", state)), quiet = TRUE)
+    gsf <- gsf[gsf$grid_id %in% grid_dt$grid_id, ]
+    if (state == "UT" && "fips_5" %in% names(gsf)) {
+      gm <- data.table(grid_id = gsf$grid_id, rate_geo_id = gsf$fips_5)
+    } else {
+      csf <- st_read(get_cbg_path(state), quiet = TRUE) |> st_transform(st_crs(gsf))
+      csf <- csf[substr(csf$GEOID, 3, 5) %in% get_metro_fips(state, 3), ]
+      gj <- st_join(st_centroid(gsf), csf[, "GEOID"], join = st_within, left = TRUE)
+      gm <- data.table(grid_id = gj$grid_id, cbg_geoid = standardize_cbg(gj$GEOID))
+      gm <- merge(gm, cbg_lk, by = "cbg_geoid", all.x = TRUE)
+      gm <- gm[, .(grid_id, rate_geo_id)]
+    }
+    grid_dt <- merge(grid_dt, gm, by = "grid_id", all.x = TRUE)
+  }
+  grid_dt[, rate_geo_id := standardize_fips(rate_geo_id)]
+
+  # load OD flows (wave-aggregated)
+  od_file <- file.path(out_dir, "intermediate", "od_home_cbg.feather")
+  od_dt <- as.data.table(arrow::read_feather(od_file))
+  od_dt[, origin_cbg := standardize_cbg(home_cbg)]
+  od_dt[, dest_cbg   := standardize_cbg(poi_cbg)]
+  cbg_lk[, cbg_geoid := standardize_cbg(cbg_geoid)]
+
+  od_dt <- merge(od_dt, cbg_lk, by.x = "origin_cbg", by.y = "cbg_geoid", all.x = TRUE)
+  setnames(od_dt, "rate_geo_id", "origin_geo_id")
+  od_dt <- merge(od_dt, cbg_lk, by.x = "dest_cbg", by.y = "cbg_geoid", all.x = TRUE)
+  setnames(od_dt, "rate_geo_id", "dest_geo_id")
+
+  # spatial join POIs to grid
+  gsf <- st_read(file.path(CONFIG$grids_dir, sprintf("grid_100m_%s.gpkg", state)), quiet = TRUE) |> st_transform(utm)
+  osf <- st_as_sf(od_dt[!is.na(poi_lon) & !is.na(poi_lat)], coords = c("poi_lon", "poi_lat"), crs = 4326) |> st_transform(utm)
+  poi_xy <- st_coordinates(osf)
+  osf$poi_utm_x <- poi_xy[,1]; osf$poi_utm_y <- poi_xy[,2]
+  osf <- st_join(osf, gsf[, "grid_id"], left = FALSE)
+  od <- as.data.table(st_drop_geometry(osf))
+  od <- od[!is.na(origin_geo_id) & !is.na(dest_geo_id)]
+
+  # activity weight
+  od[, dwell_hours := pmin(median_dwell / 60, 8)]
+  od[is.na(dwell_hours) | dwell_hours <= 0, dwell_hours := 0.5]
+  od[, activity_weight := visitors * (1 + dwell_hours)]
+
+  # distance decay -- fit power-law (sigma, alpha) from data; AIC vs Gaussian.
+  cbg_cents <- st_read(get_cbg_path(state), quiet = TRUE) |> st_transform(utm)
+  cbg_cents <- cbg_cents[substr(cbg_cents$GEOID, 3, 5) %in% get_metro_fips(state, 3), ]
+  cc <- st_coordinates(st_centroid(cbg_cents))
+  cbg_xy <- data.table(origin_cbg = standardize_cbg(cbg_cents$GEOID), home_X = cc[,1], home_Y = cc[,2])
+  od <- merge(od, cbg_xy, by = "origin_cbg", all.x = TRUE)
+  od[, od_distance_m := sqrt((poi_utm_x - home_X)^2 + (poi_utm_y - home_Y)^2)]
+
+  k_fit <- fit_distance_kernel(od$od_distance_m, od$visitors)
+  ## State-aware short/long threshold: visitor-weighted median trip distance,
+  ## so rho_short / rho_long are comparable across NY (km-scale) and UT
+  ## (10s-of-km scale). Falls back to 3 km when too few rows.
+  short_long_thresh_m <- {
+    ok <- is.finite(od$od_distance_m) & od$od_distance_m > 0 &
+          is.finite(od$visitors) & od$visitors > 0
+    if (sum(ok) >= 50) {
+      d_ok <- od$od_distance_m[ok]; w_ok <- od$visitors[ok]
+      ord <- order(d_ok); cw <- cumsum(w_ok[ord]) / sum(w_ok)
+      d_ok[ord][which(cw >= 0.5)[1]]
+    } else 3000
+  }
+  # use AIC-best form for distance weights
+  if (k_fit$form == "tpowerlaw" && is.finite(k_fit$kappa)) {
+    sigma_hat <- k_fit$sigma_tpl; alpha_hat <- k_fit$alpha_tpl; kappa_hat <- k_fit$kappa
+  } else {
+    sigma_hat <- k_fit$sigma;     alpha_hat <- k_fit$alpha;     kappa_hat <- NA_real_
+  }
+  message(sprintf("[%s/%s] OD kernel fit: form=%s sigma=%.0fm alpha=%.2f kappa=%s n=%d AIC_pl=%s AIC_tpl=%s AIC_g=%s",
+                  state, wave_id, k_fit$form, sigma_hat, alpha_hat,
+                  ifelse(is.na(kappa_hat),       "NA", sprintf("%.0fm", kappa_hat)),
+                  k_fit$n,
+                  ifelse(is.na(k_fit$aic_pl),    "NA", sprintf("%.0f", k_fit$aic_pl)),
+                  ifelse(is.na(k_fit$aic_tpl),   "NA", sprintf("%.0f", k_fit$aic_tpl)),
+                  ifelse(is.na(k_fit$aic_gauss), "NA", sprintf("%.0f", k_fit$aic_gauss))))
+  diag_dir <- file.path(out_dir, "tables"); dir.create(diag_dir, showWarnings = FALSE, recursive = TRUE)
+  fwrite(data.table(state = state, wave_id = wave_id,
+                    sigma_m = sigma_hat, alpha = alpha_hat, kappa_m = kappa_hat,
+                    sigma_gauss_m = k_fit$sigma_gauss,
+                    aic_powerlaw = k_fit$aic_pl,
+                    aic_tpowerlaw = k_fit$aic_tpl,
+                    aic_gauss = k_fit$aic_gauss,
+                    chosen_form = k_fit$form, n_pairs = k_fit$n,
+                    short_long_thresh_m = short_long_thresh_m),
+         file.path(diag_dir, "od_kernel_fit.csv"))
+
+  od[!is.na(od_distance_m), distance_weight := (1 + od_distance_m / sigma_hat)^(-alpha_hat)]
+  if (is.finite(kappa_hat)) {
+    od[!is.na(od_distance_m), distance_weight := distance_weight * exp(-od_distance_m / kappa_hat)]
+  }
+  od[is.na(od_distance_m), distance_weight := 1]
+  od[, activity_weight := activity_weight * distance_weight]
+  od[, c("home_X", "home_Y") := NULL]
+
+  # trip chain amplification (wave-level aggregation)
+  chain_file <- file.path(out_dir, "intermediate", "trip_chains.feather")
+  if (file.exists(chain_file) && "brand" %in% names(od)) {
+    chains <- as.data.table(arrow::read_feather(chain_file))
+    if (!"scope" %in% names(chains)) chains[, scope := "day"]
+    bcs_day <- chains[scope == "day", .(chain_deg_day = sum(covisit_count)), by = source_brand]
+    bcs_month <- chains[scope == "month", .(chain_deg_month = sum(covisit_count)), by = source_brand]
+    bcs <- merge(bcs_day, bcs_month, by = "source_brand", all = TRUE)
+    bcs[is.na(chain_deg_day), chain_deg_day := 0]
+    bcs[is.na(chain_deg_month), chain_deg_month := 0]
+    ## Normalise so the most-chained brand reaches boost = 1 exactly.
+    ## (Old denominator `max(x + 1)` capped boost at 1 - 1/(max+1).)
+    bcs[, boost_day   := chain_deg_day   / pmax(max(chain_deg_day),   1)]
+    bcs[, boost_month := chain_deg_month / pmax(max(chain_deg_month), 1)]
+    od <- merge(od, bcs[, .(source_brand, boost_day, boost_month)],
+                by.x = "brand", by.y = "source_brand", all.x = TRUE)
+    od[is.na(boost_day), boost_day := 0]
+    od[is.na(boost_month), boost_month := 0]
+    od[, activity_weight := activity_weight * (1 + 0.5 * boost_day + 0.25 * boost_month)]
+    od[, c("boost_day", "boost_month") := NULL]
+  }
+
+  # crowding boost
+  if ("avg_visit_density" %in% names(grid_dt)) {
+    vd_grid <- grid_dt[, .(grid_id, avg_visit_density)]
+    vd_med <- median(vd_grid$avg_visit_density[vd_grid$avg_visit_density > 0],
+                     na.rm = TRUE)
+    if (!is.na(vd_med) && vd_med > 0) {
+      # Impute NA / non-positive cells to the median (delta_g = 1, neutral).
+      # Earlier behaviour was to zero them, which silently muted the activity
+      # weight wherever building-footprint coverage was poor.
+      vd_grid[is.na(avg_visit_density) | avg_visit_density <= 0,
+              avg_visit_density := vd_med]
+      vd_grid[, crowding_factor := sqrt(pmin(avg_visit_density / vd_med, 5))]
+      od <- merge(od, vd_grid[, .(grid_id, crowding_factor)],
+                  by = "grid_id", all.x = TRUE)
+      od[is.na(crowding_factor), crowding_factor := 1]
+      od[, activity_weight := activity_weight * crowding_factor]
+      od[, crowding_factor := NULL]
+    }
+  }
+
+  # ABM pair-level flows
+  pcols <- intersect(c("origin_cbg", "origin_geo_id", "grid_id", "dest_geo_id", "poi_lon", "poi_lat",
+                        "visitors", "median_dwell", "dwell_hours", "activity_weight", "od_distance_m",
+                        "brand", "naics_code"), names(od))
+  pairs <- od[, ..pcols]
+  setnames(pairs, "grid_id", "dest_grid_id")
+  pairs_agg <- pairs[, .(visitors = sum(visitors),
+                          dwell_hours = weighted.mean(dwell_hours, visitors, na.rm = TRUE),
+                          activity_weight = sum(activity_weight),
+                          od_distance_m = weighted.mean(od_distance_m, visitors, na.rm = TRUE),
+                          n_pois = .N),
+                      by = .(origin_cbg, origin_geo_id, dest_grid_id, dest_geo_id)]
+  pairs_agg[, travel_prob := activity_weight / sum(activity_weight), by = origin_cbg]
+  pairs_agg[, transmission_weight := visitors * dwell_hours]
+  od_pairs_export <- copy(pairs_agg)
+  rm(pairs, pairs_agg); gc(verbose = FALSE)
+
+  # daily rho computation (incubation-weighted origin rates) over 90 continuous days
+  rho_list <- vector("list", n_days)
+  for (day in seq_len(n_days)) {
+    lag_days <- as.integer(names(INCUBATION_WEIGHTS))
+    lag_rates <- rbindlist(lapply(seq_along(lag_days), function(k) {
+      sd <- day - lag_days[k]
+      if (sd < 1) sd <- 1L  # clamp at wave start (no prior data)
+      cr <- case_rates[sim_day == sd, .(case_rate = mean(case_rate)), by = .(origin_geo_id = geo_id)]
+      cr[, w := INCUBATION_WEIGHTS[k]]
+      cr
+    }))
+    oday <- lag_rates[, .(origin_rate = sum(case_rate * w) / sum(w)), by = origin_geo_id]
+    dday <- case_rates[sim_day == max(1, day - 1), .(case_rate = mean(case_rate)), by = geo_id]
+    dctx <- spillover_rates(dday, centroids, phi)
+    setnames(dctx, "geo_id", "dest_geo_id")
+
+    dod <- copy(od)
+    dod <- merge(dod, oday, by = "origin_geo_id", all.x = TRUE)
+    dod <- merge(dod, dctx[, .(dest_geo_id, contextual_rate)], by = "dest_geo_id", all.x = TRUE)
+    dod[is.na(origin_rate), origin_rate := 0]
+    dod[is.na(contextual_rate), contextual_rate := 0]
+    dod[, visit_risk := origin_rate * contextual_rate]
+    ## State-aware short/long split: median trip distance (computed once below)
+    ## so `rho_short` / `rho_long` are comparable across NY (km-scale) and UT
+    ## (10s-of-km scale).
+    dod[, is_short := !is.na(od_distance_m) & od_distance_m < short_long_thresh_m]
+
+    # Robust rho: quantile-weighted (median) rather than activity-weighted mean.
+    # Insensitive to early-pandemic case-count spikes (Slater 2025 §5 future work).
+    dod[, contrib := visit_risk * activity_weight]
+    rho_list[[day]] <- dod[, .(
+      rho_raw   = sum(contrib, na.rm = TRUE),
+      rho_robust = if (.N > 0)
+                     stats::quantile(contrib[contrib > 0], ROBUST_RHO_QUANTILE,
+                                     na.rm = TRUE, names = FALSE) * .N
+                   else 0,
+      rho_short = sum(visit_risk[is_short] * activity_weight[is_short], na.rm = TRUE),
+      rho_long  = sum(visit_risk[!is_short] * activity_weight[!is_short], na.rm = TRUE),
+      exposure_import  = sum(activity_weight * origin_rate, na.rm = TRUE),
+      exposure_gravity = sum(activity_weight * origin_rate / pmax(od_distance_m / 1000, 0.1)^1.5, na.rm = TRUE),
+      total_activity = sum(activity_weight), n_od_pairs = .N, total_visitors = sum(visitors)
+    ), by = grid_id][, sim_day := day]
+  }
+  rho_dt <- rbindlist(rho_list, fill = TRUE)
+  all_gd <- CJ(grid_id = unique(grid_dt$grid_id), sim_day = 1:n_days)
+  rho_dt <- merge(all_gd, rho_dt, by = c("grid_id", "sim_day"), all.x = TRUE)
+  for (cl in c("rho_raw", "rho_robust", "rho_short", "rho_long",
+               "exposure_import", "exposure_gravity"))
+    rho_dt[is.na(get(cl)), (cl) := 0]
+  rho_dt[, rho := rho_raw]
+
+  # normalization (single wave-wide pass — no inter-month calibration)
+  gmean <- mean(rho_dt$rho[rho_dt$rho > 0], na.rm = TRUE)
+  if (is.na(gmean) || gmean <= 0) gmean <- 1
+  rho_dt[, rho_norm := pmax(rho / gmean, 0.01)]
+  pmean <- mean(rho_dt$rho_norm)
+  if (abs(pmean - 1) > 0.05) rho_dt[, rho_norm := rho_norm / pmean]
+  rho_dt[, log_rho := log(rho_norm)]
+
+  for (sc in c("rho_short", "rho_long", "rho_robust")) {
+    sm <- mean(rho_dt[[sc]][rho_dt[[sc]] > 0], na.rm = TRUE)
+    if (is.na(sm) || sm <= 0) sm <- 1
+    rho_dt[, (paste0(sc, "_norm")) := pmax(get(sc) / sm, 0.01)]
+  }
+  rho_dt[, log_rho_short := log(rho_short_norm)]
+  rho_dt[, log_rho_long := log(rho_long_norm)]
+  rho_dt[, log_rho_robust := log(rho_robust_norm)]
+  rho_dt[, log_exposure_import := log1p(exposure_import)]
+  rho_dt[, log_exposure_gravity := log1p(fifelse(is.na(exposure_gravity), 0, exposure_gravity))]
+
+  rho_dt[, kernel_mode := "TRUE_OD"]
+  fwrite(rho_dt, rho_file)
+
+  # ABM pairs (wave-level).  Schema:
+  #   origin_cbg, origin_geo_id, dest_grid_id, dest_geo_id,
+  #   visitors, dwell_hours, activity_weight, od_distance_m, n_pois,
+  #   travel_prob (per-origin), transmission_weight (= visitors * dwell_hours)
+  # Not consumed by the INLA pipeline; preserved for downstream ABM coupling
+  # (see thesis Sec. 1 -- "OD pair-level output ... preserves the
+  # infrastructure for future ABM coupling").
+  pairs_file <- file.path(out_dir, "network", "od_pairs.feather")
+  dir.create(dirname(pairs_file), showWarnings = FALSE, recursive = TRUE)
+  arrow::write_feather(od_pairs_export, pairs_file)
+
+  # spatial lag for 07
+  rho_grid <- rho_dt[, .(rho_mean = mean(rho_norm), rho_sd = sd(rho_norm),
+                          log_rho_mean = mean(log_rho)), by = grid_id]
+  arrow::write_feather(rho_grid, file.path(out_dir, "intermediate", "spatial_lag.feather"))
+
+  # persist geo mapping
+  gv <- as.data.table(arrow::read_feather(grid_file))
+  if (!"rate_geo_id" %in% names(gv)) {
+    gv <- merge(gv, grid_dt[, .(grid_id, rate_geo_id)], by = "grid_id", all.x = TRUE)
+    arrow::write_feather(gv, grid_file)
+  }
+
+  list(wave_id = wave_id, n_griddays = nrow(rho_dt),
+       rho_range = round(range(rho_dt$rho_norm), 3),
+       rho_nonzero_pct = round(100 * sum(rho_dt$rho > 0) / nrow(rho_dt), 1),
+       od_pairs_n = nrow(od_pairs_export))
+}
+```
+
+# Run All
+
+```{r run}
+results_dt <- rbindlist(run_waves_by_state(process_od_kernel), fill = TRUE)
+fwrite(results_dt, file.path(CONFIG$output_dir, "od_kernel_run_summary.csv"))
+print(results_dt)
+```
+
+## Month-Seam Diagnostic
+
+```{r month_seams, fig.width=10, fig.height=6}
+## Empirical check that month-boundary discontinuities (Advan monthly
+## aggregation -> uniform within-month allocation) do not introduce visible
+## step changes in log_rho. Vertical lines mark the 1st of each month.
+library(ggplot2)
+seam_dt <- rbindlist(lapply(seq_len(nrow(WAVE_RUNS)), function(i) {
+  st  <- WAVE_RUNS$state[i]; wid <- WAVE_RUNS$wave_id[i]
+  rho_path <- file.path(get_wave_dir(st, wid), "tables", "od_kernel_rho.csv")
+  if (!file.exists(rho_path)) return(NULL)
+  cr_path  <- file.path(get_wave_dir(st, wid), "tables", "case_rates.csv")
+  dates    <- fread(cr_path)[, .(sim_day, date = as.Date(date))][, .SD[1], by = sim_day]
+  dr       <- fread(rho_path)[, .(log_rho_mean = mean(log_rho, na.rm = TRUE)), by = sim_day]
+  merge(dr, dates, by = "sim_day")[, `:=`(state = st, wave_id = wid)]
+}), fill = TRUE)
+if (nrow(seam_dt)) {
+  seams <- seam_dt[, .(month_start = unique(as.Date(format(date, "%Y-%m-01")))[-1L]),
+                   by = .(state, wave_id)]
+  fwrite(seam_dt, file.path(CONFIG$output_dir, "log_rho_daily_means.csv"))
+  print(ggplot(seam_dt, aes(date, log_rho_mean)) +
+    geom_line(linewidth = 0.4) +
+    geom_vline(data = seams, aes(xintercept = month_start),
+               linetype = "dashed", colour = "red", alpha = 0.5) +
+    facet_wrap(state ~ wave_id, scales = "free", ncol = 3) +
+    labs(title = "Daily mean log(rho) with month-boundary markers",
+         subtitle = "Red dashes = 1st of each calendar month within wave window",
+         x = NULL, y = "mean log(rho) across grids") +
+    theme_ts())
+}
+```
+
+```{r session}
+sessionInfo()
+```

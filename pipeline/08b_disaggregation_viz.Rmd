@@ -1,0 +1,394 @@
+---
+title: "08b — Change-of-Support Disaggregation Diagnostics"
+subtitle: "Visualizing the Poisson disaggregation from MODZCTA to 100 m grid (NYC)"
+output: html_document
+---
+
+This notebook visualises the change-of-support step from `08a_build_model_data.Rmd`.
+It checks the population offset, grid-level disaggregation, Poisson calibration,
+zero inflation, MODZCTA round-trip aggregation, daily totals, and within-zone
+allocation variation.
+
+```{r setup, include=FALSE}
+source(here::here("helpers/_utils.R"))
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE,
+                      fig.width = 12, fig.height = 8)
+```
+
+```{r setup, include=FALSE}
+source(here::here("helpers/_utils.R"))
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE,
+                      fig.width = 12, fig.height = 8)
+```
+
+```{r libraries}
+load_pipeline()
+library(data.table)
+library(sf)
+library(ggplot2)
+library(patchwork)
+library(viridis)
+library(ggspatial)
+library(scales)
+library(knitr)
+
+states <- unique(WAVE_RUNS$state)
+```
+
+```{r load_data}
+all_state_data <- list()
+for (state in states) {
+  .this_state <- state
+  st_waves <- WAVE_RUNS[which(WAVE_RUNS$state == .this_state), ]
+  wave_ids <- st_waves$wave_id
+  grid_sf0 <- st_read(file.path(CONFIG$grids_dir, sprintf("grid_100m_%s.gpkg", state)), quiet = TRUE)
+  all_md <- setNames(lapply(wave_ids, function(w) {
+    fp <- file.path(get_wave_dir(state, w), "models", "model_data_gt.rds")
+    readRDS(fp)
+  }), wave_ids)
+  modzcta_sf <- NULL
+  if (state == "NY") {
+    mz_files <- list.files(file.path("data", "MODZCTA"),
+                           pattern = "\\.shp$", full.names = TRUE)
+    if (length(mz_files) >= 1) {
+      modzcta_sf <- st_read(mz_files[1], quiet = TRUE) |>
+        st_transform(st_crs(grid_sf0))
+      # Normalise the zone id column to 'modzcta' (case- and name-tolerant)
+      mz_col <- intersect(c("modzcta", "MODZCTA", "MODZCTA_CODE", "zcta"),
+                          names(modzcta_sf))[1]
+      if (!is.na(mz_col) && mz_col != "modzcta")
+        names(modzcta_sf)[names(modzcta_sf) == mz_col] <- "modzcta"
+      if ("modzcta" %in% names(modzcta_sf))
+        modzcta_sf$modzcta <- as.character(modzcta_sf$modzcta)
+    }
+  }
+  # Keep the months field name for downstream chunks.
+  all_state_data[[state]] <- list(grid_sf0 = grid_sf0, all_md = all_md,
+                                  months = wave_ids, modzcta_sf = modzcta_sf)
+}
+poly_color <- NA
+poly_lw    <- 0
+```
+
+# 1. Expected Population E
+
+The grid-level expected population $E$ combines census population with building
+density weights so that each grid cell's share of the MODZCTA population is
+proportional to its built-environment footprint.
+
+```{r E_map, fig.height=7}
+for (state in states) {
+  sd <- all_state_data[[state]]
+  grid_sf0 <- sd$grid_sf0; all_md <- sd$all_md
+  gt0 <- as.data.table(all_md[[1]]$gt_dt)
+  grid_E <- gt0[, .(E = E[1]), by = grid_id]
+  grid_plot_E <- merge(grid_sf0, grid_E, by = "grid_id")
+
+  print(ggplot(grid_plot_E) +
+    geom_sf(aes(fill = E), color = NA, lwd = 0) +
+    scale_fill_viridis_c(option = "mako", name = "E", trans = "log1p",
+                         breaks = c(0, 10, 50, 200, 1000), labels = comma) +
+    map_extras() +
+    labs(title = paste(state, "\u2014 Expected Population E per Grid Cell"),
+         subtitle = "log(1+E) scale \u2014 WorldPop 100 m population (02a)") +
+    theme_map())
+}
+```
+
+# 2. Cumulative Y per Wave
+
+For each grid cell and day, the expected Poisson mean is
+
+$$\lambda_{g,t} = \max\!\Bigl(\frac{r_{a,t} \times E_g}{10^5},\; 10^{-6}\Bigr)$$
+
+Here $r_{a,t}$ is the reporting-area daily incidence rate per 100,000 from the
+external case-rate table. The area-day integer total
+
+$$N_{a,t} = \text{round}\bigl(\sum_{g \in a} \lambda_{g,t}\bigr)$$
+
+is disaggregated via
+
+$$\mathbf{Y}_{a,t} \sim \text{Multinomial}(N_{a,t},\; \mathbf{p}_a),\qquad
+p_g = \frac{E_g}{\sum_{g \in a} E_g}.$$
+
+With $w_g = 1$, allocation depends only on the grid population offset.
+Re-aggregating the grid-level counts recovers the observed area-day total
+exactly, so no cases are created or lost.
+
+```{r Y_maps, fig.height=12}
+for (state in states) {
+  sd <- all_state_data[[state]]
+  grid_sf0 <- sd$grid_sf0; all_md <- sd$all_md; months <- sd$months
+  plots <- lapply(months, function(m) {
+    gt <- as.data.table(all_md[[m]]$gt_dt)
+    grid_agg <- gt[, .(Y_total = sum(Y, na.rm = TRUE)), by = grid_id]
+    gp <- merge(grid_sf0, grid_agg, by = "grid_id")
+    ggplot(gp) +
+      geom_sf(aes(fill = Y_total), color = NA, lwd = 0) +
+      scale_fill_viridis_c(option = "rocket", name = expression(Sigma * Y),
+                           trans = "log1p") +
+      labs(title = paste0(state, " ", m)) +
+      map_extras() + theme_map()
+  })
+  print(wrap_plots(plots, ncol = min(3, length(months))) +
+    plot_annotation(title = paste(state, "\u2014 Cumulative Disaggregated Counts (Y)"),
+                    subtitle = "Sum over all days in the wave; log(1+x) scale"))
+}
+```
+
+# 3. Lambda vs Y Scatter
+
+A well-calibrated disaggregation should show Y values scattered around the
+1:1 line with variance roughly equal to the mean (Poisson property).
+
+```{r lambda_y_scatter, fig.height=6}
+for (state in states) {
+  sd <- all_state_data[[state]]
+  all_md <- sd$all_md; months <- sd$months
+  samp_month <- months[1]
+  gt_samp <- as.data.table(all_md[[samp_month]]$gt_dt)
+  if (!"lambda_cases" %in% names(gt_samp)) {
+    next
+  }
+  set.seed(1)
+  idx <- if (nrow(gt_samp) > 50000) sample(nrow(gt_samp), 50000) else seq_len(nrow(gt_samp))
+  samp <- gt_samp[idx, .(lambda_cases, Y)]
+  print(ggplot(samp, aes(x = lambda_cases, y = Y)) +
+    geom_point(alpha = 0.05, size = 0.3, color = "steelblue") +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+    scale_x_log10(labels = comma) + scale_y_log10(labels = comma) +
+    labs(title = paste0(state, " — λ vs Y (", samp_month, ")"),
+         subtitle = "Dashed red = 1:1 line",
+         x = expression(lambda[cases]), y = "Y (Poisson draw)") +
+    theme_minimal(base_size = 13))
+}
+```
+
+# 4. Distribution of Y and Lambda
+
+```{r histograms, fig.height=5}
+for (state in states) {
+  sd <- all_state_data[[state]]
+  all_md <- sd$all_md; months <- sd$months
+  gt_all <- rbindlist(lapply(months, function(m) {
+    dt <- as.data.table(all_md[[m]]$gt_dt)
+    cols <- intersect(c("lambda_cases", "Y"), names(dt))
+    dt <- dt[, ..cols]
+    dt[, month := m]
+  }))
+  p1 <- ggplot(gt_all[Y > 0], aes(x = Y)) +
+    geom_histogram(bins = 60, fill = "steelblue", color = "white", linewidth = 0.2) +
+    scale_x_log10(labels = comma) +
+    facet_wrap(~month, scales = "free_y") +
+    labs(title = paste(state, "— Distribution of Y (non-zero)"), x = "Y", y = "Count") +
+    theme_minimal(base_size = 11)
+  if ("lambda_cases" %in% names(gt_all)) {
+    p2 <- ggplot(gt_all[lambda_cases > 1e-5], aes(x = lambda_cases)) +
+      geom_histogram(bins = 60, fill = "darkorange", color = "white", linewidth = 0.2) +
+      scale_x_log10(labels = comma) +
+      facet_wrap(~month, scales = "free_y") +
+      labs(title = paste(state, "— Distribution of λ (non-trivial)"), x = expression(lambda), y = "Count") +
+      theme_minimal(base_size = 11)
+    print(p1 / p2)
+  } else {
+    print(p1)
+  }
+}
+```
+
+# 5. Zero Inflation
+
+Many grid cells will have $Y = 0$ because their Poisson rate is very small.
+This is expected: most fine-grained cells have negligible population exposure.
+
+```{r zero_inflation, fig.height=4}
+for (state in states) {
+  sd <- all_state_data[[state]]
+  all_md <- sd$all_md; months <- sd$months
+  zi <- rbindlist(lapply(months, function(m) {
+    gt <- as.data.table(all_md[[m]]$gt_dt)
+    has_lambda <- "lambda_cases" %in% names(gt)
+    data.table(month = m, n_obs = nrow(gt),
+               pct_zero_Y = 100 * mean(gt$Y == 0),
+               pct_zero_lambda = if (has_lambda) 100 * mean(gt$lambda_cases <= 1e-6) else NA_real_,
+               mean_lambda = if (has_lambda) mean(gt$lambda_cases) else NA_real_,
+               mean_Y = mean(gt$Y))
+  }))
+  print(kable(zi, digits = 2, caption = paste(state, "— Zero-inflation summary")))
+  p <- ggplot(zi, aes(x = month)) +
+    geom_col(aes(y = pct_zero_Y), fill = "steelblue", width = 0.6)
+  if (!all(is.na(zi$pct_zero_lambda)))
+    p <- p + geom_point(aes(y = pct_zero_lambda), color = "red", size = 3)
+  p <- p + labs(title = paste(state, "— Percentage of Zero Observations"),
+                subtitle = "Bars = Y == 0 | Red dots = λ ≤ 1e-6 (grid states only)",
+                x = "Month", y = "% Zero") +
+    theme_minimal(base_size = 13)
+  print(p)
+}
+```
+
+# 6. MODZCTA Round-Trip: Observed vs Disaggregated
+
+The most stringent diagnostic of the change-of-support step is whether
+re-aggregating the grid-level $Y_{g,t}$ back to MODZCTA recovers the
+**externally observed** zone-day case totals from `case_rates.csv` (02b).
+
+For each MODZCTA $a$ and day $t$ we compute
+
+$$
+\widehat C_{a,t} \;=\; \sum_{g\in a} Y_{g,t}\quad\text{vs}\quad
+C_{a,t} \;=\; \frac{r^{\,\text{spill}}_{a,t}}{10^{5}}\cdot\frac{1}{7}\cdot\sum_{g\in a} E_{g}
+$$
+
+where $r^{\,\text{spill}}_{a,t}$ is the borough-spillover-adjusted weekly
+incidence per 100k from 02b. A well-behaved disaggregation gives a tight
+1:1 cloud and a residual map without spatial bias.
+
+```{r modzcta_roundtrip, fig.height=7}
+for (state in states) {
+  sd <- all_state_data[[state]]
+  all_md <- sd$all_md; months <- sd$months
+  if (state != "NY") next  # only NY has MODZCTA disaggregation diagnostics
+
+  # ---- per-wave round-trip ----
+  rt_per_wave <- lapply(months, function(m) {
+    gt <- as.data.table(all_md[[m]]$gt_dt)
+    case_dt <- fread(file.path(get_wave_dir(state, m), "tables", "case_rates.csv"))
+    case_dt[, geo_id := as.character(geo_id)]
+    # Observed expected cases per MODZCTA-day from external 02b table.
+    # Deduplicate E by grid before summing across days.
+    grid_E  <- unique(gt[, .(grid_id, geo_id, E)])
+    zone_E  <- grid_E[, .(E_total = sum(E)), by = geo_id]
+    obs <- merge(case_dt[, .(geo_id, sim_day, case_rate_spillover)],
+                 zone_E, by = "geo_id")
+    obs[, C_obs := case_rate_spillover / 1e5 * E_total / 7]
+    # Round-trip from grid
+    rt <- gt[, .(C_hat = sum(Y)), by = .(geo_id, sim_day)]
+    rt <- merge(rt, obs[, .(geo_id, sim_day, C_obs)],
+                by = c("geo_id", "sim_day"))
+    rt[, wave := m]
+    rt
+  })
+  rt_all <- rbindlist(rt_per_wave)
+
+  # ---- (a) per-(zone,day) scatter ----
+  print(ggplot(rt_all, aes(x = C_obs, y = C_hat)) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+    geom_point(alpha = 0.05, size = 0.4, color = "steelblue") +
+    geom_smooth(method = "gam", formula = y ~ s(x, bs = "cs"), se = FALSE,
+                color = "black", linewidth = 0.6) +
+    facet_wrap(~ wave, ncol = min(3, length(months))) +
+    scale_x_log10(labels = comma) + scale_y_log10(labels = comma) +
+    labs(title = paste(state,
+         "\u2014 MODZCTA\u00d7day round-trip: disaggregated \u03a3Y vs observed expected cases"),
+         subtitle = "Each point = one (MODZCTA, day); red = 1:1; black = GAM smoother",
+         x = expression(C[a*","*t] ~ "(observed, from 02b)"),
+         y = expression(hat(C)[a*","*t] ~ "(\u03a3 grid Y)")) +
+    theme_minimal(base_size = 12))
+
+  # ---- (b) per-MODZCTA totals (collapse over days) ----
+  rt_zone <- rt_all[, .(C_obs = sum(C_obs), C_hat = sum(C_hat)),
+                    by = .(geo_id, wave)]
+  rt_zone[, rel_err := (C_hat - C_obs) / pmax(C_obs, 1)]
+
+  # Goodness-of-fit metrics per wave
+  metrics <- rt_zone[, .(
+      n_zones = .N,
+      median_rel_err = scales::percent(median(rel_err, na.rm = TRUE), 0.1),
+      iqr_rel_err    = paste0(
+        scales::percent(quantile(rel_err, 0.25, na.rm = TRUE), 0.1), " / ",
+        scales::percent(quantile(rel_err, 0.75, na.rm = TRUE), 0.1)),
+      pearson_r = round(cor(C_hat, C_obs, use = "complete.obs"), 4),
+      bias_pct  = scales::percent(sum(C_hat) / sum(C_obs) - 1, 0.01)
+    ), keyby = wave]
+  print(kable(metrics,
+    caption = paste(state,
+      "\u2014 round-trip goodness-of-fit per wave (over MODZCTA totals)")))
+
+  # ---- (c) residual choropleth ----
+  if (!is.null(sd$modzcta_sf)) {
+    res_plots <- lapply(months, function(m) {
+      d <- rt_zone[wave == m]
+      mz <- merge(sd$modzcta_sf, d, by.x = "modzcta", by.y = "geo_id")
+      lim <- min(0.5, max(abs(mz$rel_err), na.rm = TRUE))
+      ggplot(mz) +
+        geom_sf(aes(fill = pmin(pmax(rel_err, -lim), lim)),
+                color = "grey70", lwd = 0.05) +
+        scale_fill_gradient2(low = "#2c7bb6", mid = "white", high = "#d7191c",
+                             midpoint = 0, limits = c(-lim, lim),
+                             oob = scales::squish,
+                             name = "Relative\nresidual",
+                             labels = scales::percent_format(1)) +
+        labs(title = m) + theme_map()
+    })
+    print(wrap_plots(res_plots, ncol = min(3, length(months))) +
+      plot_annotation(
+        title = paste(state, "\u2014 Per-MODZCTA round-trip residual (\u03a3Y \u2212 C_obs)/C_obs"),
+        subtitle = "Blue = under-allocated, red = over-allocated; clipped at \u00b150%"))
+  }
+}
+```
+
+# 7. Temporal Daily Totals
+
+Day-by-day comparison of the total disaggregated count versus the total
+Poisson rate across all grid cells.
+
+```{r daily_totals, fig.height=6}
+for (state in states) {
+  sd <- all_state_data[[state]]
+  all_md <- sd$all_md; months <- sd$months
+  daily_plots <- lapply(months, function(m) {
+    gt <- as.data.table(all_md[[m]]$gt_dt)
+    has_lambda <- "lambda_cases" %in% names(gt)
+    daily <- if (has_lambda) {
+      gt[, .(Y_total = sum(Y), lambda_total = sum(lambda_cases)), by = sim_day]
+    } else {
+      gt[, .(Y_total = sum(Y)), by = sim_day]
+    }
+    setorder(daily, sim_day); daily[, day_idx := .I]
+    p <- ggplot(daily, aes(x = day_idx))
+    if (has_lambda)
+      p <- p + geom_line(aes(y = lambda_total, color = "Expected (λ)"), linewidth = 0.8)
+    p <- p +
+      geom_line(aes(y = Y_total, color = "Observed (Y)"), linewidth = 0.5, alpha = 0.7) +
+      scale_color_manual(values = c("Expected (λ)" = "darkorange",
+                                    "Observed (Y)" = "steelblue")) +
+      scale_y_continuous(labels = comma) +
+      labs(title = m, x = "Day", y = "Total Count", color = NULL) +
+      theme_minimal(base_size = 11) + theme(legend.position = "bottom")
+    p
+  })
+  print(wrap_plots(daily_plots, ncol = 1) +
+    plot_annotation(title = paste(state, "— Daily Totals: Y vs λ"),
+                    subtitle = "Y tracks λ closely — Poisson noise is small relative to total"))
+}
+```
+
+# 8. Spatial Allocation Effectiveness
+
+To verify that building density meaningfully differentiates allocation,
+we compare the coefficient of variation (CV) of $\lambda$ across grid cells
+within each MODZCTA: higher CV indicates more spatial differentiation.
+
+```{r allocation_cv, fig.height=6}
+for (state in states) {
+  sd <- all_state_data[[state]]
+  all_md <- sd$all_md; months <- sd$months
+  gt0 <- as.data.table(all_md[[1]]$gt_dt)
+  if (!"lambda_cases" %in% names(gt0)) {
+    next
+  }
+  cv_dt <- gt0[lambda_cases > 1e-6,
+               .(cv_lambda = sd(lambda_cases) / mean(lambda_cases), n_grids = .N),
+               by = geo_id]
+  cv_dt <- cv_dt[n_grids >= 5]
+  geo_label <- if (state == "NY") "MODZCTA" else "County"
+  print(ggplot(cv_dt, aes(x = cv_lambda)) +
+    geom_histogram(bins = 40, fill = "steelblue", color = "white") +
+    labs(title = paste(state, "\u2014 Within-zone CV of \u03bb"),
+         subtitle = paste0("Higher CV = more spatial differentiation (", months[1], ")"),
+         x = paste0("CV(\u03bb) within ", geo_label), y = paste("Number of", geo_label, "s")) +
+    theme_minimal(base_size = 13))
+}
+```

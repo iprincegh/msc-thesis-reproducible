@@ -1,0 +1,333 @@
+---
+title: "08 - Build INLA Model Data (Spatio-Temporal g,t)"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+source(here::here("helpers/_utils.R"))
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 12, fig.height = 8)
+```
+
+## Overview
+
+$$Y_{g,t} \sim \text{NegBin}(\mu_{g,t}, \theta)$$
+$$\log(\mu_{g,t}) = \log(E_g) + \log(\mu_0(t)) + \log(\rho(g,t)) + \mathbf{x}_{g,t}^\top\boldsymbol{\beta} + b_g + \gamma_t$$
+
+## Setup
+
+```{r init}
+load_pipeline()
+library(data.table)
+library(sf)
+library(arrow)
+library(spdep)
+library(lubridate)
+library(Matrix)
+library(ggplot2)
+```
+
+## Build Model Data
+
+```{r build_function}
+build_spatiotemporal_data <- function(wave_id, wave_months) {
+  out_dir <- get_wave_dir(state, wave_id)
+  output_file <- file.path(out_dir, "models", "model_data_gt.rds")
+  dir.create(dirname(output_file), recursive = TRUE, showWarnings = FALSE)
+
+  date_range <- get_wave_date_range(wave_months)
+  n_days <- date_range$n_days
+
+  # --- Spatial covariates (wave-level) ---
+  cov_file <- file.path(out_dir, "intermediate", "spatial_covariates.feather")
+  grid_dt <- as.data.table(arrow::read_feather(cov_file))
+  # Keep non-POI cells in the full master grid so BYM2 and spatial-lag covariates
+  # remain defined across the entire panel.
+  master_grid_dt <- as.data.table(st_drop_geometry(
+    st_read(file.path(CONFIG$grids_dir, sprintf("grid_100m_%s.gpkg", state)),
+            quiet = TRUE)
+  ))[, .(grid_id)]
+  grid_dt <- merge(master_grid_dt, grid_dt, by = "grid_id", all.x = TRUE)
+  # Zero-fill numeric mobility columns for non-POI cells; leave grid_id alone.
+  num_cols <- setdiff(
+    names(grid_dt)[sapply(grid_dt, is.numeric)],
+    c("grid_id")
+  )
+  for (col in num_cols) {
+    grid_dt[is.na(get(col)), (col) := 0]
+  }
+
+  # --- Demographics (wave-level) ---
+  demo_dt <- fread(file.path(out_dir, "tables", "demographics.csv"))
+  demo_cols <- c("grid_id", "pct_older", "pct_younger",
+                 "pct_employed", "pct_unemployed",
+                 "building_density", "landuse_residential",
+                 "landuse_commercial", "landuse_industrial", "landuse_cat")
+  demo_cols <- intersect(demo_cols, names(demo_dt))
+  grid_dt <- merge(grid_dt, demo_dt[, ..demo_cols], by = "grid_id", all.x = TRUE)
+
+  # --- Grid-to-geographic-zone mapping ---
+  geom_file <- file.path(CONFIG$grids_dir, sprintf("grid_100m_%s.gpkg", state))
+  grid_geo_sf <- st_read(geom_file, quiet = TRUE)
+  grid_geo_dt <- as.data.table(st_drop_geometry(grid_geo_sf))
+
+  if (state == "NY") {
+    xwalk_file <- CONFIG$nyc_crosswalk_path
+    xwalk <- if (grepl("\\.rds$", xwalk_file)) readRDS(xwalk_file) else fread(xwalk_file)
+    xwalk[, cbg_geoid := as.character(cbg_geoid)]
+    xwalk[, modzcta := as.character(modzcta)]
+    xwalk <- xwalk[!duplicated(cbg_geoid)]
+    grid_geo_dt[, cbg_geoid := as.character(cbg_geoid)]
+    grid_geo_dt <- merge(grid_geo_dt, xwalk[, .(cbg_geoid, modzcta)], by = "cbg_geoid", all.x = TRUE)
+    grid_geo_dt[, geo_id := modzcta]
+  } else {
+    grid_geo_dt[, geo_id := as.character(fips_5)]
+  }
+  grid_dt <- merge(grid_dt, grid_geo_dt[, .(grid_id, geo_id)], by = "grid_id", all.x = TRUE)
+  # Drop boundary cells with no geo_id so the spatial model does not inherit
+  # artiﬁcial zero counts from unmapped grid cells.
+  n_unmapped <- sum(is.na(grid_dt$geo_id))
+  if (n_unmapped > 0) {
+    message(sprintf("[08a] dropping %d cells with no geo_id (%.2f%%)",
+                    n_unmapped, 100 * n_unmapped / nrow(grid_dt)))
+    grid_dt <- grid_dt[!is.na(geo_id)]
+  }
+
+  # --- Case data (wave-level, 90 continuous days) ---
+  case_dt <- fread(file.path(out_dir, "tables", "case_rates.csv"))
+  case_dt[, geo_id := as.character(geo_id)]
+  rate_divisor <- if (state == "NY") 7 else 1
+
+  # --- Temporal intensity mu_0(t) (wave-level, 90 days) ---
+  mu0_dt <- fread(file.path(out_dir, "tables", "mu0.csv"))
+  mu0_dt[, date := as.Date(date)]
+  if (!"sim_day" %in% names(mu0_dt))
+    mu0_dt[, sim_day := as.integer(date - min(date)) + 1L]
+  mu0_dt[, mu0_norm := mu0 / mean(mu0[mu0 > 0], na.rm = TRUE)]
+  mu0_dt[is.na(mu0_norm) | mu0_norm <= 0, mu0_norm := 0.01]
+
+  # --- OD kernel rho(g,t) (wave-level, 90 days) ---
+  rho_dt <- fread(file.path(out_dir, "tables", "od_kernel_rho.csv"))
+  rho_var <- var(rho_dt$log_rho, na.rm = TRUE)
+  has_od_kernel <- !is.na(rho_var) && rho_var > 1e-6
+
+  # --- Population offset E_g (time-weighted across wave months) ---
+  # E_g blends annual population estimates by the fraction of wave months in
+  # each calendar year.
+  pop_dt <- population_for_wave(state, wave_months)
+  grid_dt <- merge(grid_dt, pop_dt[, .(grid_id, E)], by = "grid_id", all.x = TRUE)
+  # Defensive floor for missing WorldPop population values.
+  grid_dt[is.na(E), E := 0.1]
+  grid_dt[, E := pmax(E, 0.1)]
+  grid_dt[, log_E := log(E)]
+
+  # --- Grid exclusion (uninhabitable cells) ---
+  if (state == "NY" && "landuse_cat" %in% names(grid_dt)) {
+    excl_cats <- c("vacant", "public", "industrial")
+    grid_dt <- grid_dt[!landuse_cat %in% excl_cats]
+  }
+  grid_dt <- grid_dt[E >= 1]
+  n_grids <- nrow(grid_dt)
+  grid_dt[, grid_idx := .I]
+
+  # --- Spatio-temporal expansion (full grid x day panel) ---
+  time_dt <- data.table(
+    time_id = 1:n_days, sim_day = 1:n_days,
+    date = date_range$start + (0:(n_days - 1)),
+    is_weekend = as.integer(wday(date_range$start + (0:(n_days - 1)), week_start = 1) >= 6)
+  )
+  time_dt <- merge(time_dt, mu0_dt[, .(sim_day, mu0_norm)], by = "sim_day", all.x = TRUE)
+  time_dt[is.na(mu0_norm), mu0_norm := 1]
+
+  # Carry raw covariates so later standardisation uses the full master-grid panel.
+  grid_cols <- intersect(names(grid_dt), c(
+    "grid_id", "grid_idx", "geo_id",
+    "visits_total", "visits_ios", "visits_android",
+    "log_visits", "log_visits_ios", "log_visits_android",
+    "log_activity", "log_activity_density",
+    "contact_intensity", "dwell_exposure",
+    "enclosed_frac", "avg_category_risk", "log_n_pois",
+    "log_distance_from_home", "log_visit_density",
+    "hourly_concentration", "daily_visit_cv", "weekday_dominance",
+    "log_repeat_ratio", "log_contact_density_hourly", "log_effective_hours",
+    "log_daytime_pop", "daytime_pop_ratio",
+    "log_rho_mean", "ses_x_rho", "ses_x_activity", "ses_x_visits",
+    "activity_intensity",
+    "weekend_ratio", "weekend_excess", "ses_contrast", "E", "log_E",
+    "pct_older", "pct_younger", "pct_employed", "pct_unemployed",
+    "building_density",
+    "landuse_residential", "landuse_commercial", "landuse_industrial"
+  ))
+
+  gt_dt <- CJ(grid_idx = 1:n_grids, time_id = 1:n_days)
+  gt_dt <- merge(gt_dt, grid_dt[, ..grid_cols], by = "grid_idx", all.x = TRUE)
+  gt_dt <- merge(gt_dt, time_dt[, .(time_id, sim_day, date, is_weekend, mu0_norm)],
+                 by = "time_id", all.x = TRUE)
+
+  # Merge OD kernel
+  rho_cols <- intersect(names(rho_dt), c(
+    "grid_id", "sim_day", "rho_norm", "log_rho",
+    "exposure_import", "log_exposure_import"))
+  gt_dt <- merge(gt_dt, rho_dt[, ..rho_cols], by = c("grid_id", "sim_day"), all.x = TRUE)
+  gt_dt[is.na(rho_norm), rho_norm := 1]
+  gt_dt[is.na(log_rho), log_rho := 0]
+
+  # --- Interactions ---
+  if ("landuse_commercial" %in% names(gt_dt) && "log_activity_density" %in% names(gt_dt)) {
+    gt_dt[, commercial_activity := landuse_commercial * log_activity_density]
+    gt_dt[, commercial_x_weekend := landuse_commercial * is_weekend]
+  }
+  if ("log_activity_density" %in% names(gt_dt))
+    gt_dt[, activity_x_weekend := log_activity_density * is_weekend]
+  if ("landuse_residential" %in% names(gt_dt))
+    gt_dt[, residential_x_weekend := landuse_residential * is_weekend]
+
+  # --- Source month / wave bookkeeping (carry source_month from case_rates) ---
+  if ("source_month" %in% names(case_dt)) {
+    sm_lookup <- unique(case_dt[, .(sim_day, source_month)])[!duplicated(sim_day)]
+    gt_dt <- merge(gt_dt, sm_lookup, by = "sim_day", all.x = TRUE)
+  } else {
+    gt_dt[, source_month := wave_id]
+  }
+
+  # --- Response Y (state-appropriate disaggregation) ---
+  case_merge_cols <- intersect(c("geo_id", "sim_day", "case_rate", "case_rate_spillover",
+                                 "new_cases", "log_gamma_t"),
+                               names(case_dt))
+  case_merge <- case_dt[, ..case_merge_cols]
+  gt_dt <- merge(gt_dt, case_merge, by = c("geo_id", "sim_day"), all.x = TRUE)
+  gt_dt[is.na(case_rate), case_rate := 0]
+  gt_dt[is.na(case_rate_spillover), case_rate_spillover := 0]
+  if ("new_cases" %in% names(gt_dt)) gt_dt[is.na(new_cases), new_cases := 0L]
+  gt_dt[is.na(log_gamma_t), log_gamma_t := 0]
+  gt_dt[, daily_rate := case_rate_spillover / rate_divisor]
+
+  set.seed(42)
+
+  if (state == "NY") {
+    # Equal within-zone weights so the allocation probability depends only on E.
+    gt_dt[, w_g := 1]
+
+    # Area-day count from the reporting-area rate and grid population.
+    gt_dt[, zone_N := as.integer(round(sum(daily_rate * E / 1e5))),
+          by = .(geo_id, sim_day)]
+    gt_dt[, prob_g := (E * w_g) / sum(E * w_g), by = .(geo_id, sim_day)]
+    gt_dt[is.na(prob_g) | !is.finite(prob_g), prob_g := 0]
+    gt_dt[, prob_g := prob_g / sum(prob_g), by = .(geo_id, sim_day)]
+
+    # lambda_cases is the expected cell count from the multinomial mean.
+    gt_dt[, lambda_cases := pmax(zone_N * prob_g, 1e-6)]
+
+    gt_dt[, Y := if (zone_N[1] > 0 && sum(prob_g) > 0)
+                   as.integer(rmultinom(1, size = zone_N[1], prob = prob_g))
+                 else 0L,
+          by = .(geo_id, sim_day)]
+    gt_dt[, c("zone_N", "prob_g", "w_g") := NULL]
+  } else {
+    gt_dt[, Y := as.integer(new_cases)]
+  }
+
+  # --- Infection pressure ---
+  if ("case_rate_spillover" %in% names(gt_dt)) {
+    setorder(gt_dt, grid_id, time_id)
+    gt_dt[, case_rate_lag1 := shift(case_rate_spillover, 1, type = "lag"), by = grid_id]
+    gt_dt[is.na(case_rate_lag1), case_rate_lag1 := 0]
+    gt_dt[, inf_pressure := rho_norm * case_rate_lag1]
+    gt_dt[, log_inf_pressure := log1p(inf_pressure)]
+    sn <- "inf_pressure_std"
+    gt_dt[, (sn) := if (sd(log_inf_pressure, na.rm = TRUE) > 0) scale(log_inf_pressure)[, 1] else 0]
+  }
+
+  # --- Offsets ---
+  gt_dt[, log_E_gt := log_E]
+  mu0_mean <- mean(gt_dt$mu0_norm[gt_dt$mu0_norm > 0], na.rm = TRUE)
+  if (!is.finite(mu0_mean) || mu0_mean <= 0) mu0_mean <- 1
+  gt_dt[, mu0_centered := mu0_norm / mu0_mean]
+  gt_dt[, log_mu0 := log(pmax(mu0_centered, 0.01))]
+
+  rho_pre_mean <- mean(gt_dt$rho_norm, na.rm = TRUE)
+  if (!is.na(rho_pre_mean) && rho_pre_mean > 0 && abs(rho_pre_mean - 1) > 0.05)
+    gt_dt[, rho_norm := rho_norm / rho_pre_mean]
+  gt_dt[, rho_norm := pmax(pmin(rho_norm, exp(5)), exp(-5))]
+  gt_dt[, log_rho := log(rho_norm)]
+  # log_rho enters the model as a fixed effect after spatial orthogonalisation.
+  gt_dt[, offset_total := log_E_gt + log_mu0 + log_gamma_t]
+
+  # --- Indices ---
+  gt_dt[, idx_spatial := grid_idx]
+  gt_dt[, idx_temporal := time_id]
+  gt_dt[, idx_interaction := .I]
+
+  # --- Standardize covariates over the full master-grid panel ---
+  # Re-standardize after the master-grid left-join so non-POI cells are included.
+  std_raw_cols <- c(
+    # contact-opportunity (07a)
+    "log_activity_density", "contact_intensity",
+    "enclosed_frac", "avg_category_risk", "log_n_pois",
+    "log_distance_from_home", "log_visit_density",
+    "log_visits", "log_activity",
+    "log_visits_ios", "log_visits_android",
+    # behavioural (07a)
+    "hourly_concentration", "daily_visit_cv", "weekday_dominance",
+    "log_repeat_ratio", "log_contact_density_hourly", "log_effective_hours",
+    "log_daytime_pop", "daytime_pop_ratio",
+    # SES + temporal (07a)
+    "ses_contrast", "weekend_excess",
+    # 07a interactions / additional summaries
+    "log_rho_mean", "ses_x_rho", "ses_x_activity", "ses_x_visits",
+    "activity_intensity",
+    # demographic / structural (07b)
+    "pct_older", "pct_younger", "pct_employed", "pct_unemployed",
+    "building_density"
+  )
+  for (col in intersect(std_raw_cols, names(gt_dt))) {
+    gt_dt[is.na(get(col)), (col) := 0]
+    sn <- paste0(col, "_std")
+    gt_dt[, (sn) := if (sd(get(col), na.rm = TRUE) > 0) scale(get(col))[, 1] else 0]
+  }
+  if ("log_exposure_import" %in% names(gt_dt)) {
+    gt_dt[is.na(log_exposure_import), log_exposure_import := 0]
+    gt_dt[, exposure_import_std := if (sd(log_exposure_import, na.rm = TRUE) > 0)
+                                     scale(log_exposure_import)[, 1] else 0]
+  }
+
+  # BYM2 adjacency is built later in create_unified_data(), not here.
+  n_obs <- nrow(gt_dt)
+
+  model_data <- list(
+    gt_dt = gt_dt, n_grids = n_grids, n_days = n_days, n_obs = n_obs,
+    grid_lookup = grid_dt[, .(grid_id, grid_idx)],
+    time_lookup = time_dt,
+    state = state, wave_id = wave_id, wave_months = wave_months,
+    date_range = date_range,
+    has_od_kernel = has_od_kernel, response_type = "disease"
+  )
+  saveRDS(model_data, output_file)
+
+  list(state = state, wave_id = wave_id, n_grids = n_grids,
+       n_days = n_days, n_obs = n_obs, has_od_kernel = has_od_kernel)
+}
+```
+
+## Process All Waves
+
+```{r process_all}
+wave_results <- run_waves_by_state(build_spatiotemporal_data)
+```
+
+## Summary
+
+```{r summary}
+wave_results_dt <- rbindlist(wave_results, fill = TRUE)
+print(wave_results_dt)
+```
+
+```{r session}
+sessionInfo()
+```

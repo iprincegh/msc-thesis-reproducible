@@ -1,0 +1,207 @@
+---
+title: "07 - Spatial Covariates Z_g"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+source(here::here("helpers/_utils.R"))
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE,
+  fig.width = 12, fig.height = 8
+)
+```
+
+## Overview
+
+Derive grid-level covariates from mobility, OD lag, and demographics; standardise continuous variables.
+
+```{r init}
+load_pipeline()
+library(data.table); library(sf); library(arrow)
+library(ggplot2); library(viridis); library(patchwork); library(ggspatial)
+
+states <- unique(WAVE_RUNS$state)
+spatial_data <- load_spatial(states)
+```
+
+```{r process}
+process_covariates <- function(wave_id, wave_months) {
+  out_dir <- get_wave_dir(state, wave_id)
+  output_file <- file.path(out_dir, "intermediate", "spatial_covariates.feather")
+
+  grid_dt <- as.data.table(arrow::read_feather(
+    file.path(out_dir, "intermediate", "grid_visits.feather")))
+
+  # Spatial lag from 06
+  lag_dt <- as.data.table(arrow::read_feather(
+    file.path(out_dir, "intermediate", "spatial_lag.feather")))
+  lag_cols <- intersect(c("grid_id", "rho_mean", "rho_sd", "log_rho_mean"), names(lag_dt))
+  grid_dt <- merge(grid_dt, lag_dt[, ..lag_cols], by = "grid_id", all.x = TRUE)
+  for (cl in setdiff(lag_cols, "grid_id")) grid_dt[is.na(get(cl)), (cl) := 0]
+
+  # --- Contact opportunity covariates ---
+  grid_dt[, log_activity_density := log1p(activity_total)]
+
+  grid_dt[, contact_intensity := log1p(visits_total / pmax(n_pois, 1))]
+  grid_dt[, log_n_pois := log1p(n_pois)]
+
+  # `dwell_exposure` removed (duplicates `log_activity_density`).
+  grid_dt[is.na(avg_distance_from_home), avg_distance_from_home := 0]
+  grid_dt[, log_distance_from_home := log1p(avg_distance_from_home)]
+  grid_dt[is.na(avg_visit_density), avg_visit_density := 0]
+  grid_dt[, log_visit_density := log1p(avg_visit_density)]
+
+  # --- Behavioral covariates ---
+  grid_dt[is.na(avg_hourly_conc), avg_hourly_conc := 1/24]
+  grid_dt[, hourly_concentration := avg_hourly_conc]
+  # peak_hour dropped: not standardized, not used downstream
+  grid_dt[is.na(avg_daily_cv), avg_daily_cv := 0]
+  grid_dt[, daily_visit_cv := avg_daily_cv]
+  grid_dt[is.na(avg_weekday_dominance), avg_weekday_dominance := 1/7]
+  grid_dt[, weekday_dominance := avg_weekday_dominance]
+  grid_dt[is.na(avg_repeat_ratio), avg_repeat_ratio := 1]
+  grid_dt[, log_repeat_ratio := log1p(avg_repeat_ratio - 1)]
+  grid_dt[is.na(avg_contact_density_hourly), avg_contact_density_hourly := 0]
+  grid_dt[, log_contact_density_hourly := log1p(avg_contact_density_hourly)]
+  grid_dt[is.na(avg_effective_hours), avg_effective_hours := 12]
+  grid_dt[, log_effective_hours := log1p(avg_effective_hours)]
+
+  # Daytime population (workplace transmission proxy)
+  dt_dt <- as.data.table(arrow::read_feather(
+    file.path(out_dir, "intermediate", "daytime_visitors.feather")))
+  dt_sf <- st_as_sf(dt_dt[!is.na(poi_lon) & !is.na(poi_lat)],
+                    coords = c("poi_lon", "poi_lat"), crs = 4326) |>
+    st_transform(get_utm_crs(state))
+  gsf <- st_read(file.path(CONFIG$grids_dir, sprintf("grid_100m_%s.gpkg", state)), quiet = TRUE) |>
+    st_transform(get_utm_crs(state))
+  dt_joined <- st_join(dt_sf, gsf[, "grid_id"], left = FALSE)
+  dt_grid <- as.data.table(st_drop_geometry(dt_joined))[,
+    .(daytime_visitors = sum(daytime_visitors, na.rm = TRUE)), by = grid_id]
+  grid_dt <- merge(grid_dt, dt_grid, by = "grid_id", all.x = TRUE)
+  grid_dt[is.na(daytime_visitors), daytime_visitors := 0]
+  grid_dt[, log_daytime_pop := log1p(daytime_visitors)]
+  grid_dt[, daytime_pop_ratio := daytime_visitors / pmax(visits_total, 1)]
+
+  # --- SES (iOS/Android as income proxy) ---
+  grid_dt[, ios_frac_grid := visits_ios / pmax(visits_ios + visits_android, 1)]
+  grid_dt[, ses_contrast := ios_frac_grid - 0.5]
+  grid_dt[, log_visits_ios := log1p(visits_ios)]
+  grid_dt[, log_visits_android := log1p(visits_android)]
+  grid_dt[, log_activity_ios := log1p(activity_ios)]
+  grid_dt[, log_activity_android := log1p(activity_android)]
+  grid_dt[is.na(ses_contrast), ses_contrast := 0]
+
+  # --- Temporal activity pattern ---
+  # Keep `weekend_excess`; drop `weekend_ratio` to avoid multicollinearity.
+  grid_dt[, weekend_excess := visits_weekend / pmax(visits_weekday + visits_weekend, 1) - (2/7)]
+
+  grid_dt[, activity_intensity := activity_total / pmax(visits_total, 1)]
+  grid_dt[, log_visits := log1p(visits_total)]
+  grid_dt[, log_activity := log1p(activity_total)]
+
+  # --- Interactions ---
+  grid_dt[, ses_x_rho := ses_contrast * log_rho_mean]
+  grid_dt[, ses_x_activity := ses_contrast * log_activity_density]
+  grid_dt[, ses_x_visits := ses_contrast * log_visits]
+
+  # --- Standardize ---
+  std_vars <- intersect(c(
+    "log_activity_density", "contact_intensity",
+    "enclosed_frac", "avg_category_risk",
+    "log_distance_from_home", "log_visit_density",
+    "log_visits", "log_activity", "log_visits_ios", "log_visits_android",
+    "ses_contrast", "log_n_pois",
+    "weekend_excess",
+    "hourly_concentration", "daily_visit_cv", "weekday_dominance",
+    "log_repeat_ratio", "log_contact_density_hourly", "log_effective_hours",
+    "log_daytime_pop", "daytime_pop_ratio",
+    "log_rho_mean",
+    "ses_x_rho", "ses_x_activity", "ses_x_visits",
+    "activity_intensity"), names(grid_dt))
+
+  for (v in std_vars) {
+    vals <- grid_dt[[v]]; vals[is.na(vals)] <- 0
+    grid_dt[[paste0(v, "_std")]] <- if (sd(vals) > 1e-10) scale(vals)[, 1] else 0
+  }
+
+  arrow::write_feather(grid_dt, output_file)
+
+  list(state = state, wave_id = wave_id, n_grids = nrow(grid_dt),
+       n_std_vars = length(std_vars),
+       log_rho_range = paste(round(range(grid_dt$log_rho_mean, na.rm = TRUE), 2),
+                             collapse = " -> "))
+}
+
+cov_summary <- rbindlist(run_waves_by_state(process_covariates), fill = TRUE)
+fwrite(cov_summary, file.path(CONFIG$output_dir, "spatial_covariates_summary.csv"))
+print(cov_summary)
+```
+
+## Covariate Maps (per wave)
+
+```{r cov_maps, fig.width=14, fig.height=12}
+viz_vars <- c("log_activity_density_std", "contact_intensity_std",
+              "log_n_pois_std", "ses_contrast_std",
+              "weekend_excess_std", "log_rho_mean_std")
+viz_labels <- c("Activity Density", "Contact Intensity",
+                "log(N POIs)", "SES Contrast",
+                "Weekend Excess", "Infection Pressure (rho)")
+
+for (state in states) {
+  cbg_utm <- spatial_data[[state]]$cbg_utm
+  grid_sf <- spatial_data[[state]]$grid_sf
+  .this_state <- state
+  st_waves <- WAVE_RUNS[which(WAVE_RUNS$state == .this_state), ]
+
+  for (wid in st_waves$wave_id) {
+    cov_dt <- as.data.table(arrow::read_feather(
+      file.path(get_wave_dir(state, wid), "intermediate", "spatial_covariates.feather")))
+    gf <- merge(grid_sf[, c("grid_id", "fips_5")], cov_dt, by = "grid_id", all.x = TRUE)
+    avail <- intersect(viz_vars, names(cov_dt))
+    plots <- lapply(seq_along(avail), function(i) {
+      if (state == "UT") {
+        gf[[avail[i]]] <- cov_dt[[avail[i]]][match(gf$grid_id, cov_dt$grid_id)]
+        cf <- ut_county_agg_sf(gf, avail[i], fun = mean)
+        ggplot() + cbg_base_layer(cbg_utm, state = state) +
+          geom_sf(data = cf, aes(fill = .data[[avail[i]]]), color = "grey40", linewidth = 0.4) +
+          scale_fill_viridis_c(option = "plasma", name = "Std") +
+          map_extras() + labs(title = paste(state, wid, "-", viz_labels[match(avail[i], viz_vars)], "(county mean)")) + theme_map()
+      } else {
+        ggplot() + cbg_base_layer(cbg_utm) +
+          geom_sf(data = gf, aes(fill = .data[[avail[i]]]), color = NA) +
+          scale_fill_viridis_c(option = "plasma", name = "Std") +
+          map_extras() + labs(title = paste(state, wid, "-", viz_labels[match(avail[i], viz_vars)])) + theme_map()
+      }
+    })
+    print(wrap_plots(plots, ncol = 2))
+  }
+}
+```
+
+## Covariate Distributions
+
+```{r cov_dist, fig.width=14, fig.height=8}
+for (state in states) {
+  .this_state <- state
+  st_waves <- WAVE_RUNS[which(WAVE_RUNS$state == .this_state), ]
+  all_cov <- rbindlist(lapply(st_waves$wave_id, function(wid) {
+    dt <- as.data.table(arrow::read_feather(
+      file.path(get_wave_dir(state, wid), "intermediate", "spatial_covariates.feather")))
+    dt[, wave_id := wid]
+  }), fill = TRUE)
+
+  avail <- intersect(viz_vars, names(all_cov))
+  long <- melt(all_cov[, c("grid_id", "wave_id", avail), with = FALSE],
+               id.vars = c("grid_id", "wave_id"), variable.name = "covariate")
+  print(ggplot(long, aes(x = value, fill = wave_id)) +
+    geom_histogram(bins = 50, alpha = 0.6, position = "identity") +
+    facet_wrap(~covariate, scales = "free") +
+    labs(title = paste(state, "— Standardized Covariate Distributions")) + theme_bw())
+}
+```
