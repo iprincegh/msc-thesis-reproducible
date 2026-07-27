@@ -63,7 +63,7 @@ generate_figures/                # Publication figure generators
 > **Important:** All scripts assume the **project root** as the R working directory.
 > Helper scripts are sourced as `source("helpers/_utils.R")` with explicit folder prefixes.
 
-### Option B — Run individual stages
+### Run individual stages
 
 ```r
 setwd("<project-root>")
