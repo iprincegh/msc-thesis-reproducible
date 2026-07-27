@@ -27,6 +27,7 @@ pipeline/                       # Numbered analysis pipeline (run in order)
   02a_population_offset.Rmd     # Dasymetric population disaggregation → E offsets
   02b_case_data.Rmd             # Process NYC MODZCTA + Utah NYT/CDC case counts
   03_advan_subset.Rmd           # Process Advan monthly patterns → POI, OD, chain
+  03b_diurnal_dwell_extract.Rmd # Extracts and processes daily dwell-time
   04_mobility_diagnostics.Rmd   # QC of mobility indicators
   05_temporal_intensity.Rmd     # Baseline temporal intensity μ₀(g,t)
   06_od_kernel.Rmd              # OD flow kernel ρ(g,t) and ABM adjacency pairs
